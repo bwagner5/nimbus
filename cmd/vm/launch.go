@@ -15,20 +15,27 @@ package main
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/bwagner5/vm/pkg/amis"
+	"github.com/bwagner5/vm/pkg/launchplan"
+	"github.com/bwagner5/vm/pkg/pretty"
+	"github.com/bwagner5/vm/pkg/securitygroups"
+	"github.com/bwagner5/vm/pkg/subnets"
 	"github.com/bwagner5/vm/pkg/vm"
 	"github.com/spf13/cobra"
 )
 
 type LaunchOptions struct {
-	DryRun         bool
-	Name           string   `table:"Name"`
-	CapacityType   string   `table:"Capacity Type"`
-	InstanceType   string   `table:"Instance Type"`
-	SubnetSelector []string `table:"Subnet Selector"`
-	AMISelector    []string `table:"OS Image Selector"`
-	IAMRole        string   `table:"IAM Role"`
-	UserData       string
+	DryRun                bool
+	Name                  string `table:"Name"`
+	CapacityType          string `table:"Capacity Type"`
+	InstanceType          string `table:"Instance Type"`
+	SubnetSelector        string `table:"Subnet Selector"`
+	AMISelector           string `table:"OS Image Selector"`
+	IAMRole               string `table:"IAM Role"`
+	SecurityGroupSelector string `table:"Security Group Selector"`
+	UserData              string
 }
 
 var (
@@ -39,16 +46,7 @@ var (
 		Long:  `launch`,
 		Args:  cobra.MinimumNArgs(0),
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			awsCfg, err := AWSConfig(cmd.Context(), globalOpts)
-			if err != nil {
-				return err
-			}
-
-			launchPlan, err := vm.New(awsCfg).Launch(cmd.Context(), launchOptions)
-			if err != nil {
-				return err
-			}
-			return nil
+			return launch(cmd.Context(), launchOptions, globalOpts)
 		},
 	}
 )
@@ -61,11 +59,50 @@ func init() {
 	cmdLaunch.Flags().StringVar(&launchOptions.InstanceType, "instance-type", "", "Instance Type")
 	cmdLaunch.Flags().StringVar(&launchOptions.IAMRole, "iam-role", "", "IAM Role")
 	cmdLaunch.Flags().StringVar(&launchOptions.UserData, "user-data", "", "User Data or a file containing User Data. e.g --user-data file://userdata.sh")
-	cmdLaunch.Flags().StringSliceVar(&launchOptions.AMISelector, "amis", []string{}, "AMI selector to dynamically find eligible OS Images. Selectors are AND'd together. e.g. --amis 'tag:Name=fancyOS,tag:Environment=dev' OR --amis 'id:ami-0123456'")
-	cmdLaunch.Flags().StringSliceVar(&launchOptions.SubnetSelector, "subnets", []string{}, "Subnet selector to dynamically find eligible subnets. Selectors are AND'd together. e.g. --subnets 'tag:Name=public,tag:Environment=dev' OR --subnets 'id:subnet-0123456'")
+	cmdLaunch.Flags().StringVar(&launchOptions.AMISelector, "amis", "", "AMI selector to dynamically find eligible OS Images. Selectors are AND'd together. e.g. --amis 'tag:Name=fancyOS,tag:Environment=dev' OR --amis 'id:ami-0123456'")
+	cmdLaunch.Flags().StringVar(&launchOptions.SubnetSelector, "subnets", "", "Subnet selector to dynamically find eligible subnets. Selectors are AND'd together. e.g. --subnets 'tag:Name=public,tag:Environment=dev' OR --subnets 'id:subnet-0123456'")
+	cmdLaunch.Flags().StringVar(&launchOptions.SecurityGroupSelector, "security-groups", "", "Security Group selector to dynamically find eligible security groups. Selectors are AND'd together. e.g. --security-groups 'tag:Name=public,tag:Environment=dev' OR --security-groups 'id:sg-0123456'")
 }
 
-func launch(ctx context.Context, launchOptions LaunchOptions) error {
+func launch(ctx context.Context, launchOptions LaunchOptions, globalOpts GlobalOptions) error {
+	awsCfg, err := AWSConfig(ctx, globalOpts)
+	if err != nil {
+		return err
+	}
 
+	subnetSelectors, err := subnets.ParseSelectors(launchOptions.SubnetSelector)
+	if err != nil {
+		return err
+	}
+	amiSelectors, err := amis.ParseSelectors(launchOptions.AMISelector)
+	if err != nil {
+		return err
+	}
+	securityGroupSelectors, err := securitygroups.ParseSelectors(launchOptions.SecurityGroupSelector)
+	if err != nil {
+		return err
+	}
+	launchPlanInput := launchplan.LaunchPlan{
+		Metadata: launchplan.LaunchMetadata{
+			Namespace: globalOpts.Namespace,
+			Name:      launchOptions.Name,
+		},
+		Spec: launchplan.LaunchSpec{
+			CapacityType:            launchOptions.CapacityType,
+			InstanceType:            launchOptions.InstanceType,
+			IAMRole:                 launchOptions.IAMRole,
+			SubnetSelectors:         subnetSelectors,
+			AMISelectors:            amiSelectors,
+			SecurityGroupsSelectors: securityGroupSelectors,
+			UserData:                launchOptions.UserData,
+		},
+	}
+
+	launchPlan, err := vm.New(awsCfg).Launch(ctx, launchOptions.DryRun, launchPlanInput)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(pretty.PrettyEncodeYAML(launchPlan))
 	return nil
 }

@@ -9,14 +9,14 @@ import (
 func TestParseSelectors(t *testing.T) {
 	type testCases struct {
 		selectorStr string
-		expected    []selectors.Selector
+		expected    []selectors.GenericSelector
 		expectedErr bool
 	}
 
 	for _, tc := range []testCases{
 		{
 			selectorStr: "tag:Name=foo,tag:Owner=bar",
-			expected: []selectors.Selector{
+			expected: []selectors.GenericSelector{
 				{
 					Tags: map[string]string{
 						"Name":  "foo",
@@ -29,7 +29,7 @@ func TestParseSelectors(t *testing.T) {
 		},
 		{
 			selectorStr: "tag:Name=foo,tag:Owner=bar,Name:baz,ID:r-123",
-			expected: []selectors.Selector{
+			expected: []selectors.GenericSelector{
 				{
 					Tags: map[string]string{
 						"Name":  "foo",
@@ -42,7 +42,7 @@ func TestParseSelectors(t *testing.T) {
 		},
 		{
 			selectorStr: "tag:Name=foo,tag:Owner=bar;Name:baz,ID:r-123",
-			expected: []selectors.Selector{
+			expected: []selectors.GenericSelector{
 				{
 					Tags: map[string]string{
 						"Name":  "foo",
@@ -57,7 +57,7 @@ func TestParseSelectors(t *testing.T) {
 		},
 		{
 			selectorStr: "tag:Name=foo,tag:Owner=bar;",
-			expected: []selectors.Selector{
+			expected: []selectors.GenericSelector{
 				{
 					Tags: map[string]string{
 						"Name":  "foo",
@@ -68,7 +68,7 @@ func TestParseSelectors(t *testing.T) {
 		},
 		{
 			selectorStr: "tag:Name,tag:Owner=bar",
-			expected: []selectors.Selector{
+			expected: []selectors.GenericSelector{
 				{
 					Tags: map[string]string{
 						"Name":  "",

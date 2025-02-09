@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-type Selector struct {
+type GenericSelector struct {
 	Tags map[string]string
 	Name string
 	ID   string
@@ -25,16 +25,16 @@ type Selector struct {
 //  2. id:resource-0123456 (OR'd together, so the resource must have the given ID)
 //
 // The resources selected will be the given resource ID and resources that have both tags "Name=fancyOS" and "Environment=dev"
-func ParseSelectors(selectors string) ([]*Selector, error) {
+func ParseSelectors(selectors string) ([]*GenericSelector, error) {
 	selectors = strings.TrimSpace(selectors)
-	var parsedSelectors []*Selector
+	var parsedSelectors []*GenericSelector
 	selectorTerms := strings.Split(selectors, ";")
 	for _, term := range selectorTerms {
 		term = strings.TrimSpace(term)
 		if term == "" {
 			continue
 		}
-		selector := Selector{
+		selector := GenericSelector{
 			Tags: make(map[string]string),
 		}
 		components := strings.Split(term, ",")

@@ -4,42 +4,13 @@ import (
 	"context"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/bwagner5/vm/pkg/amis"
-	"github.com/bwagner5/vm/pkg/securitygroups"
-	"github.com/bwagner5/vm/pkg/subnets"
+	"github.com/bwagner5/vm/pkg/launchplan"
 )
 
 type VMI interface {
-	Launch(context.Context, LaunchPlan)
+	Launch(context.Context, launchplan.LaunchPlan) (launchplan.LaunchPlan, error)
 	Describe(context.Context)
 	Terminate(context.Context)
-}
-
-type LaunchPlan struct {
-	Metadata LaunchMetadata
-	Spec     LaunchSpec
-	Status   LaunchStatus
-}
-
-type LaunchMetadata struct {
-	Namespace string
-	Name      string
-}
-
-type LaunchSpec struct {
-	CapacityType            string
-	InstanceType            string
-	SubnetSelectors         []subnets.Selector
-	SecurityGroupsSelectors []securitygroups.Selector
-	AMISelectors            []amis.Selector
-	IAMRole                 string
-	UserData                string
-}
-
-type LaunchStatus struct {
-	Subnets        []subnets.Subnet
-	SecurityGroups []securitygroups.SecurityGroup
-	AMIs           []amis.AMI
 }
 
 type AWSVM struct {
@@ -52,6 +23,6 @@ func New(awsCfg *aws.Config) AWSVM {
 	}
 }
 
-func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan LaunchPlan) (LaunchPlan, error) {
+func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan launchplan.LaunchPlan) (launchplan.LaunchPlan, error) {
 	return launchPlan, nil
 }
