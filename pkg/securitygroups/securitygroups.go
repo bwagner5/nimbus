@@ -53,6 +53,13 @@ func ParseSelectors(selectorStr string) ([]Selector, error) {
 	return sgSelectors, nil
 }
 
+// NewWatcher creates a new Security Group Watcher
+func NewWatcher(sg SDKSecurityGroupOps) Watcher {
+	return Watcher{
+		sg: sg,
+	}
+}
+
 // Resolve returns a list of security groups that match the provided selectors
 // Multiple calls to EC2 may be sent to resolve the selectors
 func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]SecurityGroup, error) {
@@ -89,7 +96,7 @@ func filterSets(selectors []Selector) [][]ec2types.Filter {
 		default:
 			var filters []ec2types.Filter
 			for k, v := range term.Tags {
-				if v == "*" {
+				if v == "*" || v == "" {
 					filters = append(filters, ec2types.Filter{
 						Name:   aws.String("tag-key"),
 						Values: []string{k},
