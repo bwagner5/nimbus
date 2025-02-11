@@ -34,18 +34,26 @@ type Subnet struct {
 	ec2types.Subnet
 }
 
-// ParseSelectors converts a string of selectors into a slice of subnet selectors
+// ParseSelectors parses a string of selectors into a slice of Selector structs
 func ParseSelectors(selectorStr string) ([]Selector, error) {
-	selectors, err := selectors.ParseSelectors(selectorStr)
+	selectors, err := selectors.ParseSelectorsTokens(selectorStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse subnet selectors: %w", err)
 	}
-	subnetSelectors := make([]Selector, len(selectors))
-	for i, selector := range selectors {
-		subnetSelectors[i] = Selector{
+	subnetSelectors := make([]Selector, 0, len(selectors))
+	for _, selector := range selectors {
+		subnetSelector := Selector{
 			Tags: selector.Tags,
-			ID:   selector.ID,
 		}
+		for k, v := range selector.KeyVals {
+			switch k {
+			case "id":
+				subnetSelector.ID = v
+			default:
+				return nil, fmt.Errorf("invalid subnet selector key: %s", k)
+			}
+		}
+		subnetSelectors = append(subnetSelectors, subnetSelector)
 	}
 	return subnetSelectors, nil
 }

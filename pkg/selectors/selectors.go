@@ -5,13 +5,37 @@ import (
 	"strings"
 )
 
+// GenericSelector is a struct that represents a set of selectors
+// Tags are treated special and returned as a map of key-value pairs
+// All other keywords are treated as key-value pairs in the KevVals map.
+// The caller must parse the Keys of the KeyVals map to check if they are supported.
 type GenericSelector struct {
-	Tags map[string]string
-	Name string
-	ID   string
+	Tags    map[string]string
+	KeyVals map[string]string
 }
 
-// ParseSelectors parses a string of selectors into a slice of Selector structs
+// ParseSelectorsTokens parses a string of selectors into a GenericSelector struct
+//
+// Example:
+//
+// "tag:Name=fancyOS,tag:Environment=dev;id:ami-0123456"
+//
+// Returns:
+//
+//	[]GenericSelector{
+//		{
+//			Tags: map[string]string{
+//				"Name":       "fancyOS",
+//				"Environment": "dev",
+//			},
+//		},
+//		{
+//	     	KeyVals: map[string]string{
+//				"id": "ami-0123456",
+//			},
+//		},
+//	}
+//
 // Selectors are parsed as a set of terms. Each term is separated by a semicolon.
 // Terms are AND'd together.
 // Within a term, individual selection criteria is separated by a comma. Criteria are OR'd together.
@@ -25,53 +49,44 @@ type GenericSelector struct {
 //  2. id:resource-0123456 (OR'd together, so the resource must have the given ID)
 //
 // The resources selected will be the given resource ID and resources that have both tags "Name=fancyOS" and "Environment=dev"
-func ParseSelectors(selectors string) ([]*GenericSelector, error) {
+func ParseSelectorsTokens(selectors string) ([]GenericSelector, error) {
 	selectors = strings.TrimSpace(selectors)
-	var parsedSelectors []*GenericSelector
 	selectorTerms := strings.Split(selectors, ";")
+	genericSelectors := make([]GenericSelector, 0, len(selectorTerms))
 	for _, term := range selectorTerms {
-		term = strings.TrimSpace(term)
-		if term == "" {
+		if strings.TrimSpace(term) == "" {
 			continue
 		}
-		selector := GenericSelector{
-			Tags: make(map[string]string),
-		}
+		genericSelector := GenericSelector{}
 		components := strings.Split(term, ",")
-		for _, s := range components {
-			switch {
-			case strings.HasPrefix(strings.ToLower(s), "tag:"):
-				tokens := strings.Split(s, ":")
-				if len(tokens) != 2 {
-					return nil, fmt.Errorf("invalid tag selector: %s. Expected 1 \":\", but found %d", s, len(tokens)-1)
+		for _, c := range components {
+			keyword, value, found := strings.Cut(c, ":")
+			if !found {
+				return nil, fmt.Errorf("invalid selector: %s", c)
+			}
+			if keyword == "tag" {
+				if genericSelector.Tags == nil {
+					genericSelector.Tags = make(map[string]string)
 				}
-				tagKeyValue := tokens[1]
-				tagTokens := strings.Split(tagKeyValue, "=")
+				tagTokens := strings.Split(value, "=")
 				if len(tagTokens) > 2 {
-					return nil, fmt.Errorf("invalid tag selector: %s. Expected 0 or 1 \"=\", but found %d", tagKeyValue, len(tagTokens)-1)
+					return nil, fmt.Errorf("invalid tag selector: %s. Expected 0 or 1 \"=\", but found %d", value, len(tagTokens)-1)
 				}
 				// if only the tag key was given, then we set the value to the empty string and use it as a wildcard
 				if len(tagTokens) == 1 {
-					selector.Tags[tagTokens[0]] = ""
+					genericSelector.Tags[tagTokens[0]] = ""
 				}
 				if len(tagTokens) == 2 {
-					selector.Tags[tagTokens[0]] = tagTokens[1]
+					genericSelector.Tags[tagTokens[0]] = tagTokens[1]
 				}
-			case strings.HasPrefix(strings.ToLower(s), "id:"):
-				tokens := strings.Split(s, ":")
-				if len(tokens) != 2 {
-					return nil, fmt.Errorf("invalid id selector: %s. Expected 1 \":\", but found %d", s, len(tokens)-1)
+			} else {
+				if genericSelector.KeyVals == nil {
+					genericSelector.KeyVals = make(map[string]string)
 				}
-				selector.ID = tokens[1]
-			case strings.HasPrefix(strings.ToLower(s), "name:"):
-				tokens := strings.Split(s, ":")
-				if len(tokens) != 2 {
-					return nil, fmt.Errorf("invalid name selector: %s. Expected 1 \":\", but found %d", s, len(tokens)-1)
-				}
-				selector.Name = tokens[1]
+				genericSelector.KeyVals[strings.ToLower(keyword)] = value
 			}
 		}
-		parsedSelectors = append(parsedSelectors, &selector)
+		genericSelectors = append(genericSelectors, genericSelector)
 	}
-	return parsedSelectors, nil
+	return genericSelectors, nil
 }

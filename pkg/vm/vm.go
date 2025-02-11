@@ -5,6 +5,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/bwagner5/vm/pkg/amis"
 	"github.com/bwagner5/vm/pkg/launchplan"
 	"github.com/bwagner5/vm/pkg/securitygroups"
@@ -25,12 +26,13 @@ type AWSVM struct {
 }
 
 func New(awsCfg *aws.Config) AWSVM {
-	ec2api := ec2.NewFromConfig(*awsCfg)
+	ec2API := ec2.NewFromConfig(*awsCfg)
+	ssmAPI := ssm.NewFromConfig(*awsCfg)
 	return AWSVM{
 		awsCfg:               awsCfg,
-		securityGroupWatcher: securitygroups.NewWatcher(ec2api),
-		subnetWatcher:        subnets.NewWatcher(ec2api),
-		amiWatcher:           amis.NewWatcher(ec2api),
+		securityGroupWatcher: securitygroups.NewWatcher(ec2API),
+		subnetWatcher:        subnets.NewWatcher(ec2API),
+		amiWatcher:           amis.NewWatcher(ec2API, ssmAPI),
 	}
 }
 

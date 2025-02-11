@@ -36,21 +36,30 @@ type SecurityGroup struct {
 	ec2types.SecurityGroup
 }
 
-// ParseSelectors converts a string of selectors into a slice of security group selectors
+// ParseSelectors parses a string of selectors into a slice of Selector structs
 func ParseSelectors(selectorStr string) ([]Selector, error) {
-	selectors, err := selectors.ParseSelectors(selectorStr)
+	selectors, err := selectors.ParseSelectorsTokens(selectorStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse security group selectors: %w", err)
 	}
-	sgSelectors := make([]Selector, len(selectors))
-	for i, selector := range selectors {
-		sgSelectors[i] = Selector{
+	securityGroupSelectors := make([]Selector, 0, len(selectors))
+	for _, selector := range selectors {
+		securityGroupSelector := Selector{
 			Tags: selector.Tags,
-			Name: selector.Name,
-			ID:   selector.ID,
 		}
+		for k, v := range selector.KeyVals {
+			switch k {
+			case "id":
+				securityGroupSelector.ID = v
+			case "name":
+				securityGroupSelector.Name = v
+			default:
+				return nil, fmt.Errorf("invalid security group selector key: %s", k)
+			}
+		}
+		securityGroupSelectors = append(securityGroupSelectors, securityGroupSelector)
 	}
-	return sgSelectors, nil
+	return securityGroupSelectors, nil
 }
 
 // NewWatcher creates a new Security Group Watcher

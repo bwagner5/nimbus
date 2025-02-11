@@ -22,8 +22,6 @@ func TestParseSelectors(t *testing.T) {
 						"Name":  "foo",
 						"Owner": "bar",
 					},
-					Name: "",
-					ID:   "",
 				},
 			},
 		},
@@ -35,8 +33,10 @@ func TestParseSelectors(t *testing.T) {
 						"Name":  "foo",
 						"Owner": "bar",
 					},
-					Name: "baz",
-					ID:   "r-123",
+					KeyVals: map[string]string{
+						"name": "baz",
+						"id":   "r-123",
+					},
 				},
 			},
 		},
@@ -50,8 +50,10 @@ func TestParseSelectors(t *testing.T) {
 					},
 				},
 				{
-					Name: "baz",
-					ID:   "r-123",
+					KeyVals: map[string]string{
+						"name": "baz",
+						"id":   "r-123",
+					},
 				},
 			},
 		},
@@ -79,7 +81,7 @@ func TestParseSelectors(t *testing.T) {
 		},
 	} {
 		t.Run(tc.selectorStr, func(t *testing.T) {
-			parsedSelectors, err := selectors.ParseSelectors(tc.selectorStr)
+			parsedSelectors, err := selectors.ParseSelectorsTokens(tc.selectorStr)
 			if tc.expectedErr && err != nil {
 				return
 			}
@@ -92,12 +94,17 @@ func TestParseSelectors(t *testing.T) {
 			}
 
 			for i, expected := range tc.expected {
-				if parsedSelectors[i].Name != expected.Name {
-					t.Errorf("expected Name %q, got %q", expected.Name, parsedSelectors[i].Name)
+
+				if len(parsedSelectors[i].KeyVals) != len(expected.KeyVals) {
+					t.Fatalf("expected %d key/vals, got %d", len(expected.KeyVals), len(parsedSelectors[i].KeyVals))
 				}
-				if parsedSelectors[i].ID != expected.ID {
-					t.Errorf("expected ID %q, got %q", expected.ID, parsedSelectors[i].ID)
+
+				for k, v := range expected.KeyVals {
+					if parsedSelectors[i].KeyVals[k] != v {
+						t.Errorf("expected key/vals %q=%q, got %q=%q", k, v, k, parsedSelectors[i].KeyVals[k])
+					}
 				}
+
 				if len(parsedSelectors[i].Tags) != len(expected.Tags) {
 					t.Fatalf("expected %d tags, got %d", len(expected.Tags), len(parsedSelectors[i].Tags))
 				}

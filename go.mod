@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.36.1
 	github.com/aws/aws-sdk-go-v2/config v1.29.6
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.202.4
+	github.com/aws/aws-sdk-go-v2/service/ssm v1.56.12
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/samber/lo v1.49.1
 	github.com/spf13/cobra v1.8.1
