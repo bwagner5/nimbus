@@ -18,13 +18,13 @@ type LaunchMetadata struct {
 }
 
 type LaunchSpec struct {
-	CapacityType            string
-	InstanceType            string
-	SubnetSelectors         []subnets.Selector
-	SecurityGroupsSelectors []securitygroups.Selector
-	AMISelectors            []amis.Selector
-	IAMRole                 string
-	UserData                string
+	CapacityType           string
+	InstanceType           string
+	SubnetSelectors        []subnets.Selector
+	SecurityGroupSelectors []securitygroups.Selector
+	AMISelectors           []amis.Selector
+	IAMRole                string
+	UserData               string
 }
 
 type LaunchStatus struct {
