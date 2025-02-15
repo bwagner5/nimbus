@@ -16,10 +16,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/bwagner5/nimbus/pkg/instances"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/bwagner5/nimbus/pkg/pretty"
+	"github.com/bwagner5/nimbus/pkg/providers/instances"
 	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
 	"github.com/bwagner5/nimbus/pkg/vm"
 	"github.com/samber/lo"
@@ -48,16 +50,16 @@ var (
 		Use:   "get ",
 		Short: "get",
 		Long:  `get`,
-		Args:  cobra.MinimumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		Args:  cobra.MinimumNArgs(0),
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			return get(cmd.Context(), getOptions, globalOpts)
 		},
 	}
 )
 
 func init() {
-	rootCmd.AddCommand(cmdLaunch)
-	cmdLaunch.Flags().StringVar(&launchOptions.Name, "name", "", "Name of the VM")
+	rootCmd.AddCommand(cmdGet)
+	cmdGet.Flags().StringVar(&getOptions.Name, "name", "", "Name of the VM")
 }
 
 func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) error {
@@ -71,8 +73,11 @@ func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) e
 		return err
 	}
 
-	instancesUI := lo.Map(instanceList, func(instance instances.Instance, _ int) GetUI {
-		return instanceToGetUI(instance)
+	instancesUI := lo.FilterMap(instanceList, func(instance instances.Instance, _ int) (GetUI, bool) {
+		if instance.State.Name == ec2types.InstanceStateNameTerminated {
+			return GetUI{}, false
+		}
+		return instanceToGetUI(instance), true
 	})
 
 	switch globalOpts.Output {
@@ -88,12 +93,18 @@ func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) e
 	return nil
 }
 
+// TODO: may want to add a type to instance that abstracts some of this basic info so that the TUI is similar
+// It would be nice to not need two types between the sdk, cli, and tui
 func instanceToGetUI(instance instances.Instance) GetUI {
+	instanceProfileID := ""
+	if instance.IamInstanceProfile != nil {
+		instanceProfileID = strings.Split(*instance.IamInstanceProfile.Arn, "/")[1]
+	}
 	return GetUI{
 		Name:         tagutils.EC2TagsToMap(instance.Tags)["Name"],
 		Status:       string(instance.State.Name),
-		IAMRole:      lo.FromPtr(instance.IamInstanceProfile.Id),
-		Age:          time.Since(lo.FromPtr(instance.LaunchTime)).String(),
+		IAMRole:      instanceProfileID,
+		Age:          time.Since(lo.FromPtr(instance.LaunchTime)).Truncate(time.Second).String(),
 		Arch:         string(instance.Architecture),
 		InstanceType: string(instance.InstanceType),
 		Zone:         lo.FromPtr(instance.Placement.AvailabilityZone),

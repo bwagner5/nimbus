@@ -1,10 +1,12 @@
 package launchplan
 
 import (
-	"github.com/bwagner5/nimbus/pkg/amis"
-	"github.com/bwagner5/nimbus/pkg/instancetypes"
-	"github.com/bwagner5/nimbus/pkg/securitygroups"
-	"github.com/bwagner5/nimbus/pkg/subnets"
+	"github.com/bwagner5/nimbus/pkg/providers/amis"
+	"github.com/bwagner5/nimbus/pkg/providers/instances"
+	"github.com/bwagner5/nimbus/pkg/providers/instancetypes"
+	"github.com/bwagner5/nimbus/pkg/providers/launchtemplates"
+	"github.com/bwagner5/nimbus/pkg/providers/securitygroups"
+	"github.com/bwagner5/nimbus/pkg/providers/subnets"
 )
 
 type LaunchPlan struct {
@@ -33,4 +35,6 @@ type LaunchStatus struct {
 	SecurityGroups []securitygroups.SecurityGroup
 	AMIs           []amis.AMI
 	InstanceTypes  []instancetypes.InstanceType
+	Instances      []instances.Instance
+	LaunchTemplate launchtemplates.LaunchTemplate
 }

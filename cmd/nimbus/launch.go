@@ -17,12 +17,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bwagner5/nimbus/pkg/amis"
-	"github.com/bwagner5/nimbus/pkg/instancetypes"
 	"github.com/bwagner5/nimbus/pkg/launchplan"
 	"github.com/bwagner5/nimbus/pkg/pretty"
-	"github.com/bwagner5/nimbus/pkg/securitygroups"
-	"github.com/bwagner5/nimbus/pkg/subnets"
+	"github.com/bwagner5/nimbus/pkg/providers/amis"
+	"github.com/bwagner5/nimbus/pkg/providers/instancetypes"
+	"github.com/bwagner5/nimbus/pkg/providers/securitygroups"
+	"github.com/bwagner5/nimbus/pkg/providers/subnets"
 	"github.com/bwagner5/nimbus/pkg/vm"
 	"github.com/spf13/cobra"
 )
@@ -112,7 +112,7 @@ func launch(ctx context.Context, launchOptions LaunchOptions, globalOpts GlobalO
 		fmt.Println(pretty.EncodeYAML(launchPlan))
 	}
 
-	fmt.Printf("Launch %s/%s\n", globalOpts.Namespace, launchOptions.Name)
+	fmt.Printf("Launched %s/%s\n", globalOpts.Namespace, launchOptions.Name)
 
 	return nil
 }
