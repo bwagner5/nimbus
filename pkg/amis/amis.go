@@ -9,7 +9,7 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
-	"github.com/bwagner5/vm/pkg/selectors"
+	"github.com/bwagner5/nimbus/pkg/selectors"
 	"github.com/samber/lo"
 )
 

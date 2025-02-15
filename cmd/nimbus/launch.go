@@ -17,12 +17,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bwagner5/vm/pkg/amis"
-	"github.com/bwagner5/vm/pkg/launchplan"
-	"github.com/bwagner5/vm/pkg/pretty"
-	"github.com/bwagner5/vm/pkg/securitygroups"
-	"github.com/bwagner5/vm/pkg/subnets"
-	"github.com/bwagner5/vm/pkg/vm"
+	"github.com/bwagner5/nimbus/pkg/amis"
+	"github.com/bwagner5/nimbus/pkg/instancetypes"
+	"github.com/bwagner5/nimbus/pkg/launchplan"
+	"github.com/bwagner5/nimbus/pkg/pretty"
+	"github.com/bwagner5/nimbus/pkg/securitygroups"
+	"github.com/bwagner5/nimbus/pkg/subnets"
+	"github.com/bwagner5/nimbus/pkg/vm"
 	"github.com/spf13/cobra"
 )
 
@@ -30,7 +31,7 @@ type LaunchOptions struct {
 	DryRun                bool
 	Name                  string `table:"Name"`
 	CapacityType          string `table:"Capacity Type"`
-	InstanceType          string `table:"Instance Type"`
+	InstanceTypeSelector  string `table:"Instance Type Selector"`
 	SubnetSelector        string `table:"Subnet Selector"`
 	AMISelector           string `table:"OS Image Selector"`
 	IAMRole               string `table:"IAM Role"`
@@ -56,7 +57,7 @@ func init() {
 	cmdLaunch.Flags().BoolVarP(&launchOptions.DryRun, "dry-run", "d", false, "Will NOT launch anything, only print the launch plan")
 	cmdLaunch.Flags().StringVar(&launchOptions.Name, "name", "", "Name of the VM")
 	cmdLaunch.Flags().StringVar(&launchOptions.CapacityType, "capacity-type", "", "Spot or On-Demand")
-	cmdLaunch.Flags().StringVar(&launchOptions.InstanceType, "instance-type", "", "Instance Type")
+	cmdLaunch.Flags().StringVar(&launchOptions.InstanceTypeSelector, "instance-types", "", "Instance Type Criteria e.g. --instance-types 'vcpus:2-6,arch:arm64,local-storage:100GiB-'")
 	cmdLaunch.Flags().StringVar(&launchOptions.IAMRole, "iam-role", "", "IAM Role")
 	cmdLaunch.Flags().StringVar(&launchOptions.UserData, "user-data", "", "User Data or a file containing User Data. e.g --user-data file://userdata.sh")
 	cmdLaunch.Flags().StringVar(&launchOptions.AMISelector, "amis", "", "AMI selector to dynamically find eligible OS Images. Selectors are AND'd together. e.g. --amis 'tag:Name=fancyOS,tag:Environment=dev' OR --amis 'id:ami-0123456'")
@@ -82,19 +83,23 @@ func launch(ctx context.Context, launchOptions LaunchOptions, globalOpts GlobalO
 	if err != nil {
 		return err
 	}
+	instanceTypeSelectors, err := instancetypes.ParseSelectors(launchOptions.InstanceTypeSelector)
+	if err != nil {
+		return err
+	}
 	launchPlanInput := launchplan.LaunchPlan{
 		Metadata: launchplan.LaunchMetadata{
 			Namespace: globalOpts.Namespace,
 			Name:      launchOptions.Name,
 		},
 		Spec: launchplan.LaunchSpec{
-			CapacityType:            launchOptions.CapacityType,
-			InstanceType:            launchOptions.InstanceType,
-			IAMRole:                 launchOptions.IAMRole,
-			SubnetSelectors:         subnetSelectors,
-			AMISelectors:            amiSelectors,
-			SecurityGroupsSelectors: securityGroupSelectors,
-			UserData:                launchOptions.UserData,
+			CapacityType:           launchOptions.CapacityType,
+			IAMRole:                launchOptions.IAMRole,
+			InstanceTypeSelectors:  instanceTypeSelectors,
+			SubnetSelectors:        subnetSelectors,
+			AMISelectors:           amiSelectors,
+			SecurityGroupSelectors: securityGroupSelectors,
+			UserData:               launchOptions.UserData,
 		},
 	}
 
@@ -103,6 +108,11 @@ func launch(ctx context.Context, launchOptions LaunchOptions, globalOpts GlobalO
 		return err
 	}
 
-	fmt.Println(pretty.PrettyEncodeYAML(launchPlan))
+	if globalOpts.Verbose {
+		fmt.Println(pretty.EncodeYAML(launchPlan))
+	}
+
+	fmt.Printf("Launch %s/%s\n", globalOpts.Namespace, launchOptions.Name)
+
 	return nil
 }

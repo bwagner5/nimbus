@@ -1,24 +1,24 @@
-# vm
+# nimbus
 
-vm is a simple CLI tool to launch EC2 instances. 
+nimbus is a simple CLI tool to launch EC2 instances. 
 
 ## Examples
 
 ```
 export VM_NAMESPACE=dev
 
-> vm launch 
+> nimbus launch 
 
-> vm list --env dev
+> nimbus list --env dev
 
-> vm terminate 
+> nimbus terminate 
 ```
 
 ## Launch Plans
 
 ```
-> cat vm-launch-plan.yaml
-apiVersion: github.com/bwagner5/vm/v1alpha1
+> cat nimbus-launch-plan.yaml
+apiVersion: github.com/bwagner5/nimbus/v1alpha1
 kind: VirtualMachine
 metadata:
     name: my-vm
@@ -68,7 +68,7 @@ The configurations include network information as well. Networks can be discover
 
 ```
 > cat my-company-vms.yaml
-apiVersion: github.com/bwagner5/vm/v1alpha1
+apiVersion: github.com/bwagner5/nimbus/v1alpha1
 kind: VMAlias
 metadata:
     name: dev-medium

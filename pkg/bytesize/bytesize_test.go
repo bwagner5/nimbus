@@ -3,7 +3,7 @@ package bytesize_test
 import (
 	"testing"
 
-	"github.com/bwagner5/vm/pkg/bytesize"
+	"github.com/bwagner5/nimbus/pkg/bytesize"
 	"github.com/samber/lo"
 )
 

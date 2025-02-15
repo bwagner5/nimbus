@@ -10,8 +10,8 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// PrettyEncodeJSON takes any struct data and prints it in a pretty JSON format
-func PrettyEncodeJSON(data any) string {
+// EncodeJSON takes any struct data and prints it in a pretty JSON format
+func EncodeJSON(data any) string {
 	var buffer bytes.Buffer
 	enc := json.NewEncoder(&buffer)
 	enc.SetIndent("", "    ")
@@ -21,9 +21,9 @@ func PrettyEncodeJSON(data any) string {
 	return buffer.String()
 }
 
-// PrettyEncodeYAML takes any struct data and prints it in a pretty YAML format
-func PrettyEncodeYAML(data any) string {
-	jsonStr := PrettyEncodeJSON(data)
+// EncodeYAML takes any struct data and prints it in a pretty YAML format
+func EncodeYAML(data any) string {
+	jsonStr := EncodeJSON(data)
 	// Convert the JSON to an object.
 	var jsonObj interface{}
 	// We are using yaml.Unmarshal here (instead of json.Unmarshal) because the

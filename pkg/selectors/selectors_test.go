@@ -3,7 +3,7 @@ package selectors_test
 import (
 	"testing"
 
-	"github.com/bwagner5/vm/pkg/selectors"
+	"github.com/bwagner5/nimbus/pkg/selectors"
 )
 
 func TestParseSelectors(t *testing.T) {

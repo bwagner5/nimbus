@@ -33,7 +33,7 @@ brews:
     tap:
       owner: bwagner5
       name: homebrew-wagner
-    homepage: "https://github.com/bwagner5/vm"
+    homepage: "https://github.com/bwagner5/nimbus"
     description: "vm"
     license: "Apache-2.0"
     test: |
@@ -49,4 +49,4 @@ dockers:
     - "--label=org.opencontainers.image.title={{.ProjectName}}"
     - "--label=org.opencontainers.image.revision={{.FullCommit}}"
     - "--label=org.opencontainers.image.version={{.Version}}"
-    - "--label=org.opencontainers.image.source=https://github.com/bwagner5/vm"
+    - "--label=org.opencontainers.image.source=https://github.com/bwagner5/nimbus"
