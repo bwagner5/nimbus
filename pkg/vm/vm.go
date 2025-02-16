@@ -66,6 +66,9 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan launchplan.La
 		return launchPlan, err
 	}
 
+	// Validate that if either of SubnetSelectors or SecurityGroupSelectors are not specified, then BOTH should not be specified
+	// IF a SubnetSelector is not specified, that means there is no place to launch instances, so we try to create new network infra (VPC, IGW, Subnets, Route Table, and Security Group)
+	// IF a SecurityGroupSelector is not specified, the instance launch is invalid, since we need a SecurityGroup to launch.  (TODO: maybe we could default to the default SG)
 	if len(launchPlan.Spec.SecurityGroupSelectors) != 0 && len(launchPlan.Spec.SubnetSelectors) == 0 {
 		return launchPlan, fmt.Errorf("security group selector was specified without a subnet selector")
 	}
