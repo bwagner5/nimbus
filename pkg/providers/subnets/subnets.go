@@ -24,8 +24,9 @@ type SDKSubnetsOps interface {
 
 // Selector is a struct that represents a subnet selector
 type Selector struct {
-	Tags map[string]string
-	ID   string
+	Tags  map[string]string
+	ID    string
+	VPCID string
 }
 
 // Subnet represent an AWS Subnet
@@ -95,6 +96,11 @@ func filterSets(selectors []Selector) [][]ec2types.Filter {
 		switch {
 		case term.ID != "":
 			idFilter.Values = append(idFilter.Values, term.ID)
+		case term.VPCID != "":
+			filterResult = append(filterResult, []ec2types.Filter{{
+				Name:   aws.String("vpc-id"),
+				Values: []string{term.VPCID},
+			}})
 		default:
 			var filters []ec2types.Filter
 			for k, v := range term.Tags {

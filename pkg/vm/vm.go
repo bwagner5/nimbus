@@ -16,6 +16,8 @@ import (
 	"github.com/bwagner5/nimbus/pkg/providers/launchtemplates"
 	"github.com/bwagner5/nimbus/pkg/providers/securitygroups"
 	"github.com/bwagner5/nimbus/pkg/providers/subnets"
+	"github.com/bwagner5/nimbus/pkg/providers/vpcs"
+	"github.com/bwagner5/nimbus/pkg/utils/ec2utils"
 	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
 	"github.com/samber/lo"
 )
@@ -30,6 +32,7 @@ type AWSVM struct {
 	awsCfg                *aws.Config
 	securityGroupWatcher  securitygroups.Watcher
 	subnetWatcher         subnets.Watcher
+	vpcWatcher            vpcs.Watcher
 	amiWatcher            amis.Watcher
 	instanceTypeWatcher   instancetypes.Watcher
 	instanceWatcher       instances.Watcher
@@ -43,6 +46,7 @@ func New(awsCfg *aws.Config) AWSVM {
 	return AWSVM{
 		awsCfg:                awsCfg,
 		securityGroupWatcher:  securitygroups.NewWatcher(ec2API),
+		vpcWatcher:            vpcs.NewWatcher(*awsCfg, ec2API),
 		subnetWatcher:         subnets.NewWatcher(ec2API),
 		amiWatcher:            amis.NewWatcher(ec2API, ssmAPI),
 		instanceWatcher:       instances.NewWatcher(ec2API),
@@ -53,14 +57,6 @@ func New(awsCfg *aws.Config) AWSVM {
 }
 
 func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan launchplan.LaunchPlan) (launchplan.LaunchPlan, error) {
-	securityGroups, err := v.securityGroupWatcher.Resolve(ctx, launchPlan.Spec.SecurityGroupSelectors)
-	if err != nil {
-		return launchPlan, err
-	}
-	subnets, err := v.subnetWatcher.Resolve(ctx, launchPlan.Spec.SubnetSelectors)
-	if err != nil {
-		return launchPlan, err
-	}
 	amis, err := v.amiWatcher.Resolve(ctx, launchPlan.Spec.AMISelectors)
 	if err != nil {
 		return launchPlan, err
@@ -70,12 +66,84 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan launchplan.La
 		return launchPlan, err
 	}
 
+	if len(launchPlan.Spec.SecurityGroupSelectors) != 0 && len(launchPlan.Spec.SubnetSelectors) == 0 {
+		return launchPlan, fmt.Errorf("security group selector was specified without a subnet selector")
+	}
+	if len(launchPlan.Spec.SubnetSelectors) != 0 && len(launchPlan.Spec.SecurityGroupSelectors) == 0 {
+		return launchPlan, fmt.Errorf("subnet selector was specified without a security group selector")
+	}
+
+	var vpc vpcs.VPC
+	var subnetList []subnets.Subnet
+	var securityGroups []securitygroups.SecurityGroup
+	if len(launchPlan.Spec.SubnetSelectors) != 0 {
+		subnetList, err = v.subnetWatcher.Resolve(ctx, launchPlan.Spec.SubnetSelectors)
+		if err != nil {
+			return launchPlan, err
+		}
+	} else {
+		existingVPCs, err := v.vpcWatcher.Resolve(ctx, []vpcs.Selector{{
+			Tags: map[string]string{
+				tagutils.NamespaceTagKey: launchPlan.Metadata.Namespace,
+			},
+		}})
+		if err != nil {
+			return launchPlan, err
+		}
+
+		if len(existingVPCs) == 0 {
+			vpcDetails, err := v.vpcWatcher.CreateVPC(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name)
+			if err != nil {
+				return launchPlan, err
+			}
+			vpc = vpcs.VPC{Vpc: *vpcDetails.VPC}
+			subnetList = append(subnetList, lo.Map(vpcDetails.Subnets, func(subnet *ec2types.Subnet, _ int) subnets.Subnet { return subnets.Subnet{Subnet: *subnet} })...)
+		} else {
+			vpc = existingVPCs[0]
+			subnetList, err = v.subnetWatcher.Resolve(ctx, []subnets.Selector{{
+				VPCID: *vpc.VpcId,
+			}})
+			if err != nil {
+				return launchPlan, err
+			}
+		}
+
+		securityGroups, err = v.securityGroupWatcher.Resolve(ctx, []securitygroups.Selector{{
+			Tags: tagutils.NamespacedTags(launchPlan.Metadata.Namespace, launchPlan.Metadata.Name),
+		}})
+
+		if len(securityGroups) == 0 {
+			sgID, err := v.securityGroupWatcher.CreateSecurityGroup(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name, securitygroups.CreateSecurityGroupOpts{
+				Name:  fmt.Sprintf("%s/%s", launchPlan.Metadata.Namespace, launchPlan.Metadata.Name),
+				VPCID: *vpc.VpcId,
+			})
+			if err != nil {
+				return launchPlan, err
+			}
+			securityGroups, err = v.securityGroupWatcher.Resolve(ctx, []securitygroups.Selector{{
+				ID: sgID,
+			}})
+			if err != nil {
+				return launchPlan, err
+			}
+		}
+	}
+
+	if len(launchPlan.Spec.SecurityGroupSelectors) != 0 {
+		securityGroups, err = v.securityGroupWatcher.Resolve(ctx, launchPlan.Spec.SecurityGroupSelectors)
+		if err != nil {
+			return launchPlan, err
+		}
+	}
+
 	launchTemplateID, err := v.launchTemplateWatcher.CreateLaunchTemplate(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name, launchPlan.Spec.UserData, launchPlan.Status.SecurityGroups)
-	if err != nil {
+	if err != nil && !ec2utils.IsAlreadyExistsErr(err) {
 		return launchPlan, err
 	}
 
-	launchTemplates, err := v.launchTemplateWatcher.Resolve(ctx, []launchtemplates.Selector{{ID: launchTemplateID}})
+	launchTemplates, err := v.launchTemplateWatcher.Resolve(ctx, []launchtemplates.Selector{{
+		Tags: tagutils.NamespacedTags(launchPlan.Metadata.Namespace, launchPlan.Metadata.Name),
+	}})
 	if err != nil {
 		return launchPlan, err
 	}
@@ -88,7 +156,7 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan launchplan.La
 
 	launchPlan.Status = launchplan.LaunchStatus{
 		SecurityGroups: securityGroups,
-		Subnets:        subnets,
+		Subnets:        subnetList,
 		AMIs:           amis,
 		InstanceTypes:  instanceTypes,
 		LaunchTemplate: launchTemplates[0],
@@ -129,10 +197,6 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan launchplan.La
 		return launchPlan, nil
 	}
 	launchPlan.Status.Instances = launchedInstances
-
-	if err := v.launchTemplateWatcher.DeleteLaunchTemplate(ctx, launchTemplateID); err != nil {
-		return launchPlan, err
-	}
 	return launchPlan, nil
 }
 

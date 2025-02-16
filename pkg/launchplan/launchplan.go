@@ -7,6 +7,7 @@ import (
 	"github.com/bwagner5/nimbus/pkg/providers/launchtemplates"
 	"github.com/bwagner5/nimbus/pkg/providers/securitygroups"
 	"github.com/bwagner5/nimbus/pkg/providers/subnets"
+	"github.com/bwagner5/nimbus/pkg/providers/vpcs"
 )
 
 type LaunchPlan struct {
@@ -31,6 +32,7 @@ type LaunchSpec struct {
 }
 
 type LaunchStatus struct {
+	VPC            vpcs.VPC
 	Subnets        []subnets.Subnet
 	SecurityGroups []securitygroups.SecurityGroup
 	AMIs           []amis.AMI

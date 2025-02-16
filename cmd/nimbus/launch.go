@@ -105,6 +105,9 @@ func launch(ctx context.Context, launchOptions LaunchOptions, globalOpts GlobalO
 
 	launchPlan, err := vm.New(awsCfg).Launch(ctx, launchOptions.DryRun, launchPlanInput)
 	if err != nil {
+		if globalOpts.Verbose {
+			fmt.Println(pretty.EncodeYAML(launchPlan))
+		}
 		return err
 	}
 

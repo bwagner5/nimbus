@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/bwagner5/nimbus/pkg/selectors"
+	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
 	"github.com/samber/lo"
 )
 
@@ -21,6 +22,8 @@ type Watcher struct {
 type SDKSecurityGroupOps interface {
 	ec2.DescribeSecurityGroupsAPIClient
 	ec2.DescribeSecurityGroupRulesAPIClient
+	CreateSecurityGroup(context.Context, *ec2.CreateSecurityGroupInput, ...func(*ec2.Options)) (*ec2.CreateSecurityGroupOutput, error)
+	AuthorizeSecurityGroupIngress(context.Context, *ec2.AuthorizeSecurityGroupIngressInput, ...func(*ec2.Options)) (*ec2.AuthorizeSecurityGroupIngressOutput, error)
 }
 
 // Selector is a struct that represents a security group selector
@@ -28,6 +31,11 @@ type Selector struct {
 	Tags map[string]string
 	Name string
 	ID   string
+}
+
+type CreateSecurityGroupOpts struct {
+	Name  string
+	VPCID string
 }
 
 // SecurityGroup represent an AWS Security Group
@@ -89,6 +97,22 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]SecurityG
 		}
 	}
 	return securityGroups, nil
+}
+
+func (w Watcher) CreateSecurityGroup(ctx context.Context, namespace string, name string, createSecurityGroupOpts CreateSecurityGroupOpts) (string, error) {
+	sgOut, err := w.sg.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
+		GroupName:   &createSecurityGroupOpts.Name,
+		VpcId:       &createSecurityGroupOpts.VPCID,
+		Description: aws.String("nimbus generated security group"),
+		TagSpecifications: []ec2types.TagSpecification{{
+			ResourceType: ec2types.ResourceTypeSecurityGroup,
+			Tags:         tagutils.EC2NamespacedTags(namespace, name),
+		}},
+	})
+	if err != nil {
+		return "", err
+	}
+	return *sgOut.GroupId, nil
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK
