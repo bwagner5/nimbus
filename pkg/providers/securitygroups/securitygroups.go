@@ -24,6 +24,7 @@ type SDKSecurityGroupOps interface {
 	ec2.DescribeSecurityGroupRulesAPIClient
 	CreateSecurityGroup(context.Context, *ec2.CreateSecurityGroupInput, ...func(*ec2.Options)) (*ec2.CreateSecurityGroupOutput, error)
 	AuthorizeSecurityGroupIngress(context.Context, *ec2.AuthorizeSecurityGroupIngressInput, ...func(*ec2.Options)) (*ec2.AuthorizeSecurityGroupIngressOutput, error)
+	DeleteSecurityGroup(context.Context, *ec2.DeleteSecurityGroupInput, ...func(*ec2.Options)) (*ec2.DeleteSecurityGroupOutput, error)
 }
 
 // Selector is a struct that represents a security group selector
@@ -113,6 +114,11 @@ func (w Watcher) CreateSecurityGroup(ctx context.Context, namespace string, name
 		return "", err
 	}
 	return *sgOut.GroupId, nil
+}
+
+func (w Watcher) DeleteSecurityGroup(ctx context.Context, sgID string) error {
+	_, err := w.sg.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{GroupId: &sgID})
+	return err
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK

@@ -1,4 +1,4 @@
-package launchplan
+package plans
 
 import (
 	"github.com/bwagner5/nimbus/pkg/providers/amis"

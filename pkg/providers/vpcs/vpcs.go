@@ -93,7 +93,7 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]VPC, erro
 	return vpcs, nil
 }
 
-func (w Watcher) CreateVPC(ctx context.Context, namespace string, name string) (*vpc.Details, error) {
+func (w Watcher) CreateVPC(ctx context.Context, namespace, name string) (*vpc.Details, error) {
 	out, err := w.vpcAPI.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{})
 	if err != nil {
 		return nil, err

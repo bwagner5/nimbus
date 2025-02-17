@@ -17,7 +17,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bwagner5/nimbus/pkg/launchplan"
+	"github.com/bwagner5/nimbus/pkg/plans"
 	"github.com/bwagner5/nimbus/pkg/pretty"
 	"github.com/bwagner5/nimbus/pkg/providers/amis"
 	"github.com/bwagner5/nimbus/pkg/providers/instancetypes"
@@ -87,12 +87,12 @@ func launch(ctx context.Context, launchOptions LaunchOptions, globalOpts GlobalO
 	if err != nil {
 		return err
 	}
-	launchPlanInput := launchplan.LaunchPlan{
-		Metadata: launchplan.LaunchMetadata{
+	launchPlanInput := plans.LaunchPlan{
+		Metadata: plans.LaunchMetadata{
 			Namespace: globalOpts.Namespace,
 			Name:      launchOptions.Name,
 		},
-		Spec: launchplan.LaunchSpec{
+		Spec: plans.LaunchSpec{
 			CapacityType:           launchOptions.CapacityType,
 			IAMRole:                launchOptions.IAMRole,
 			InstanceTypeSelectors:  instanceTypeSelectors,

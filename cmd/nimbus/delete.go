@@ -14,10 +14,13 @@ limitations under the License.
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
+	"github.com/bwagner5/nimbus/pkg/pretty"
 	"github.com/bwagner5/nimbus/pkg/vm"
 	"github.com/spf13/cobra"
 )
@@ -58,14 +61,32 @@ func delete(ctx context.Context, deleteOptions DeleteOptions, globalOpts GlobalO
 	if err != nil {
 		return err
 	}
-	resourcesDeleted, err := vm.New(awsCfg).Delete(ctx, globalOpts.Namespace, deleteOptions.Name)
+
+	vmClient := vm.New(awsCfg)
+
+	deletionPlan, err := vmClient.DeletionPlan(ctx, globalOpts.Namespace, deleteOptions.Name)
 	if err != nil {
 		return err
 	}
-	if len(resourcesDeleted) == 0 {
-		fmt.Println("Nothing to delete")
-	} else {
-		fmt.Printf("Deleted %s\n", strings.Join(resourcesDeleted, ", "))
+
+	if !deleteOptions.Force {
+		fmt.Println(pretty.EncodeYAML(deletionPlan))
+		fmt.Printf("Proceed with deletion? ")
+		reader := bufio.NewReader(os.Stdin)
+		userInput, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(userInput)), "y") {
+			fmt.Println("Aborting deletion...")
+			return nil
+		}
 	}
+
+	deletionPlan, err = vmClient.Delete(ctx, deletionPlan)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
