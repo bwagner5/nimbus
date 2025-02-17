@@ -13,7 +13,7 @@ require (
 	github.com/bwagner5/vpcctl v0.0.8
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/samber/lo v1.49.1
-	github.com/spf13/cobra v1.8.1
+	github.com/spf13/cobra v1.9.1
 	gopkg.in/yaml.v2 v2.4.0
 	gopkg.in/yaml.v3 v3.0.1
 )
