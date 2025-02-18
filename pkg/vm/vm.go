@@ -10,10 +10,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/bwagner5/nimbus/pkg/plans"
 	"github.com/bwagner5/nimbus/pkg/providers/amis"
+	"github.com/bwagner5/nimbus/pkg/providers/azs"
 	"github.com/bwagner5/nimbus/pkg/providers/fleets"
+	"github.com/bwagner5/nimbus/pkg/providers/igws"
 	"github.com/bwagner5/nimbus/pkg/providers/instances"
 	"github.com/bwagner5/nimbus/pkg/providers/instancetypes"
 	"github.com/bwagner5/nimbus/pkg/providers/launchtemplates"
+	"github.com/bwagner5/nimbus/pkg/providers/routetables"
 	"github.com/bwagner5/nimbus/pkg/providers/securitygroups"
 	"github.com/bwagner5/nimbus/pkg/providers/subnets"
 	"github.com/bwagner5/nimbus/pkg/providers/vpcs"
@@ -30,9 +33,12 @@ type VMI interface {
 
 type AWSVM struct {
 	awsCfg                *aws.Config
-	securityGroupWatcher  securitygroups.Watcher
-	subnetWatcher         subnets.Watcher
 	vpcWatcher            vpcs.Watcher
+	subnetWatcher         subnets.Watcher
+	azWatcher             azs.Watcher
+	igwWatcher            igws.Watcher
+	routeTableWatcher     routetables.Watcher
+	securityGroupWatcher  securitygroups.Watcher
 	amiWatcher            amis.Watcher
 	instanceTypeWatcher   instancetypes.Watcher
 	instanceWatcher       instances.Watcher
@@ -45,9 +51,12 @@ func New(awsCfg *aws.Config) AWSVM {
 	ssmAPI := ssm.NewFromConfig(*awsCfg)
 	return AWSVM{
 		awsCfg:                awsCfg,
-		securityGroupWatcher:  securitygroups.NewWatcher(ec2API),
 		vpcWatcher:            vpcs.NewWatcher(*awsCfg, ec2API),
 		subnetWatcher:         subnets.NewWatcher(ec2API),
+		azWatcher:             azs.NewWatcher(ec2API),
+		igwWatcher:            igws.NewWatcher(ec2API),
+		routeTableWatcher:     routetables.NewWatcher(ec2API),
+		securityGroupWatcher:  securitygroups.NewWatcher(ec2API),
 		amiWatcher:            amis.NewWatcher(ec2API, ssmAPI),
 		instanceWatcher:       instances.NewWatcher(ec2API),
 		instanceTypeWatcher:   instancetypes.NewWatcher(*awsCfg),
@@ -57,14 +66,18 @@ func New(awsCfg *aws.Config) AWSVM {
 }
 
 func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan plans.LaunchPlan) (plans.LaunchPlan, error) {
+	launchPlan.Status = plans.LaunchStatus{}
 	amis, err := v.amiWatcher.Resolve(ctx, launchPlan.Spec.AMISelectors)
 	if err != nil {
 		return launchPlan, err
 	}
+	launchPlan.Status.AMIs = amis
+
 	instanceTypes, err := v.instanceTypeWatcher.Resolve(ctx, launchPlan.Spec.InstanceTypeSelectors)
 	if err != nil {
 		return launchPlan, err
 	}
+	launchPlan.Status.InstanceTypes = instanceTypes
 
 	// Validate that if either of SubnetSelectors or SecurityGroupSelectors are not specified, then BOTH should not be specified
 	// IF a SubnetSelector is not specified, that means there is no place to launch instances, so we try to create new network infra (VPC, IGW, Subnets, Route Table, and Security Group)
@@ -76,7 +89,7 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan plans.LaunchP
 		return launchPlan, fmt.Errorf("subnet selector was specified without a security group selector")
 	}
 
-	var vpc vpcs.VPC
+	var vpc *vpcs.VPC
 	var subnetList []subnets.Subnet
 	var securityGroups []securitygroups.SecurityGroup
 	if len(launchPlan.Spec.SubnetSelectors) != 0 {
@@ -84,6 +97,7 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan plans.LaunchP
 		if err != nil {
 			return launchPlan, err
 		}
+		launchPlan.Status.Subnets = subnetList
 	} else {
 		existingVPCs, err := v.vpcWatcher.Resolve(ctx, []vpcs.Selector{{
 			Tags: map[string]string{
@@ -95,20 +109,52 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan plans.LaunchP
 		}
 
 		if len(existingVPCs) == 0 {
-			vpcDetails, err := v.vpcWatcher.CreateVPC(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name)
+			vpc, err = v.vpcWatcher.Create(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name, "10.0.0.0/16")
 			if err != nil {
 				return launchPlan, err
 			}
-			vpc = vpcs.VPC{Vpc: *vpcDetails.VPC}
-			subnetList = append(subnetList, lo.Map(vpcDetails.Subnets, func(subnet *ec2types.Subnet, _ int) subnets.Subnet { return subnets.Subnet{Subnet: *subnet} })...)
+			launchPlan.Status.VPC = *vpc
+
+			availabilityZones, err := v.azWatcher.Resolve(ctx, nil)
+			if err != nil {
+				return launchPlan, err
+			}
+
+			subnetSpecs := lo.Map(lo.Subset(availabilityZones, 0, 3), func(az azs.AvailabilityZone, i int) subnets.SubnetSpec {
+				return subnets.SubnetSpec{
+					AZ:     *az.ZoneName,
+					CIDR:   fmt.Sprintf("10.0.%d.0/24", i),
+					Public: true,
+				}
+			})
+
+			subnetList, err = v.subnetWatcher.Create(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name, vpc, subnetSpecs)
+			if err != nil {
+				return launchPlan, err
+			}
+			launchPlan.Status.Subnets = subnetList
+
+			igw, err := v.igwWatcher.Create(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name, *vpc)
+			if err != nil {
+				return launchPlan, err
+			}
+			launchPlan.Status.InternetGateway = *igw
+
+			publicRouteTable, _, err := v.routeTableWatcher.Create(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name, subnetList, igw, nil)
+			if err != nil {
+				return launchPlan, err
+			}
+			launchPlan.Status.RouteTables = append(launchPlan.Status.RouteTables, *publicRouteTable)
+
 		} else {
-			vpc = existingVPCs[0]
+			vpc = &existingVPCs[0]
 			subnetList, err = v.subnetWatcher.Resolve(ctx, []subnets.Selector{{
 				VPCID: *vpc.VpcId,
 			}})
 			if err != nil {
 				return launchPlan, err
 			}
+			launchPlan.Status.VPC = *vpc
 		}
 
 		securityGroups, err = v.securityGroupWatcher.Resolve(ctx, []securitygroups.Selector{{
@@ -130,6 +176,7 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan plans.LaunchP
 				return launchPlan, err
 			}
 		}
+		launchPlan.Status.SecurityGroups = securityGroups
 	}
 
 	if len(launchPlan.Spec.SecurityGroupSelectors) != 0 {
@@ -137,6 +184,7 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan plans.LaunchP
 		if err != nil {
 			return launchPlan, err
 		}
+		launchPlan.Status.SecurityGroups = securityGroups
 	}
 
 	launchTemplateID, err := v.launchTemplateWatcher.CreateLaunchTemplate(ctx, launchPlan.Metadata.Namespace, launchPlan.Metadata.Name, launchPlan.Spec.UserData, launchPlan.Status.SecurityGroups)
@@ -156,14 +204,7 @@ func (v AWSVM) Launch(ctx context.Context, dryRun bool, launchPlan plans.LaunchP
 	if len(launchTemplates) == 0 {
 		return launchPlan, fmt.Errorf("could not find launch template details for launch template %s", launchTemplateID)
 	}
-
-	launchPlan.Status = plans.LaunchStatus{
-		SecurityGroups: securityGroups,
-		Subnets:        subnetList,
-		AMIs:           amis,
-		InstanceTypes:  instanceTypes,
-		LaunchTemplate: launchTemplates[0],
-	}
+	launchPlan.Status.LaunchTemplate = launchTemplates[0]
 
 	fleetID, err := v.fleetWatcher.CreateFleet(ctx, fleets.CreateFleetOptions{
 		Name:           launchPlan.Metadata.Name,
@@ -245,6 +286,22 @@ func (v AWSVM) DeletionPlan(ctx context.Context, namespace, name string) (plans.
 	}
 	deletionPlan.Spec.SecurityGroups = securityGroups
 
+	internetGateways, err := v.igwWatcher.Resolve(ctx, []igws.Selector{{
+		Tags: tagutils.NamespacedTags(namespace, name),
+	}})
+	if err != nil {
+		return deletionPlan, err
+	}
+	deletionPlan.Spec.InternetGateways = internetGateways
+
+	routeTables, err := v.routeTableWatcher.Resolve(ctx, []routetables.Selector{{
+		Tags: tagutils.NamespacedTags(namespace, name),
+	}})
+	if err != nil {
+		return deletionPlan, err
+	}
+	deletionPlan.Spec.RouteTables = routeTables
+
 	subnets, err := v.subnetWatcher.Resolve(ctx, []subnets.Selector{{
 		Tags: tagutils.NamespacedTags(namespace, name),
 	}})
@@ -293,7 +350,7 @@ func (v AWSVM) Delete(ctx context.Context, deletionPlan plans.DeletionPlan) (pla
 	}
 
 	for _, securityGroup := range deletionPlan.Spec.SecurityGroups {
-		if deletionPlan.Status.LaunchTemplates[*securityGroup.GroupId] {
+		if deletionPlan.Status.SecurityGroups[*securityGroup.GroupId] {
 			continue
 		}
 		if err := v.securityGroupWatcher.DeleteSecurityGroup(ctx, *securityGroup.GroupId); err != nil {
@@ -305,32 +362,56 @@ func (v AWSVM) Delete(ctx context.Context, deletionPlan plans.DeletionPlan) (pla
 		deletionPlan.Status.SecurityGroups[*securityGroup.GroupId] = true
 	}
 
+	for _, igw := range deletionPlan.Spec.InternetGateways {
+		if deletionPlan.Status.InternetGateways[*igw.InternetGatewayId] {
+			continue
+		}
+		if err := v.igwWatcher.Delete(ctx, *igw.InternetGatewayId); err != nil {
+			return deletionPlan, err
+		}
+		if deletionPlan.Status.InternetGateways == nil {
+			deletionPlan.Status.InternetGateways = map[string]bool{}
+		}
+		deletionPlan.Status.InternetGateways[*igw.InternetGatewayId] = true
+	}
+
+	for _, routeTable := range deletionPlan.Spec.RouteTables {
+		if deletionPlan.Status.RouteTables[*routeTable.RouteTableId] {
+			continue
+		}
+		if err := v.routeTableWatcher.Delete(ctx, *routeTable.RouteTableId); err != nil {
+			return deletionPlan, err
+		}
+		if deletionPlan.Status.RouteTables == nil {
+			deletionPlan.Status.RouteTables = map[string]bool{}
+		}
+		deletionPlan.Status.RouteTables[*routeTable.RouteTableId] = true
+	}
+
+	for _, subnet := range deletionPlan.Spec.Subnets {
+		if deletionPlan.Status.Subnets[*subnet.SubnetId] {
+			continue
+		}
+		if err := v.subnetWatcher.Delete(ctx, *subnet.SubnetId); err != nil {
+			return deletionPlan, err
+		}
+		if deletionPlan.Status.Subnets == nil {
+			deletionPlan.Status.Subnets = map[string]bool{}
+		}
+		deletionPlan.Status.Subnets[*subnet.SubnetId] = true
+	}
+
 	for _, vpc := range deletionPlan.Spec.VPCs {
 		if deletionPlan.Status.VPCs[*vpc.VpcId] {
 			continue
 		}
-		vpcNamespace, ok := lo.Find(vpc.Tags, func(tag ec2types.Tag) bool { return *tag.Key == tagutils.NamespaceTagKey })
-		if !ok {
-			continue
-		}
-		vpcName, ok := lo.Find(vpc.Tags, func(tag ec2types.Tag) bool { return *tag.Key == tagutils.NameTagKey })
-		if !ok {
-			continue
-		}
-		if err := v.vpcWatcher.DeleteVPC(ctx, *vpcNamespace.Value, *vpcName.Value); err != nil {
+		if err := v.vpcWatcher.Delete(ctx, *vpc.VpcId); err != nil {
 			return deletionPlan, err
 		}
 		if deletionPlan.Status.VPCs == nil {
 			deletionPlan.Status.VPCs = map[string]bool{}
 		}
 		deletionPlan.Status.VPCs[*vpc.VpcId] = true
-		// the VPC deletion includes subnets for now since it uses vpcctl
-		if deletionPlan.Status.Subnets == nil {
-			deletionPlan.Status.Subnets = map[string]bool{}
-		}
-		for _, subnet := range deletionPlan.Spec.Subnets {
-			deletionPlan.Status.Subnets[*subnet.SubnetId] = true
-		}
 	}
 
 	return deletionPlan, nil

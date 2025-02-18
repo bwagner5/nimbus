@@ -6,8 +6,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/bwagner5/nimbus/pkg/providers/igws"
+	"github.com/bwagner5/nimbus/pkg/providers/natgws"
+	"github.com/bwagner5/nimbus/pkg/providers/subnets"
 	"github.com/bwagner5/nimbus/pkg/selectors"
+	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
 	"github.com/samber/lo"
 )
 
@@ -20,6 +25,10 @@ type Watcher struct {
 // AWS SDK for Go v2 does not provide a single interface that combines all the necessary methods
 type SDKRouteTablesOps interface {
 	ec2.DescribeRouteTablesAPIClient
+	CreateRouteTable(context.Context, *ec2.CreateRouteTableInput, ...func(*ec2.Options)) (*ec2.CreateRouteTableOutput, error)
+	DeleteRouteTable(context.Context, *ec2.DeleteRouteTableInput, ...func(*ec2.Options)) (*ec2.DeleteRouteTableOutput, error)
+	AssociateRouteTable(context.Context, *ec2.AssociateRouteTableInput, ...func(*ec2.Options)) (*ec2.AssociateRouteTableOutput, error)
+	CreateRoute(context.Context, *ec2.CreateRouteInput, ...func(*ec2.Options)) (*ec2.CreateRouteOutput, error)
 }
 
 // Selector is a struct that represents a routeTable selector
@@ -88,8 +97,95 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]RouteTabl
 	return routeTables, nil
 }
 
-func (w Watcher) Create(ctx context.Context) (string, error) {
+// Create creates a public and/or a private subnet based on the subnets, Internet Gateway, and NAT Gateway passed in.
+// If subnetsList contains a subnet with MapPublicIpOnLaunch set to true, then Create will create 1 public route table
+// If subnetsList does NOT contain a subnet with MapPublicIpOnLaunch set to true, then Create will create 1 private route table
+// At most, 2 route tables will be created if subnetsList contains a subnet with MapPublicIpOnLaunch set to true and another set to false.
+//
+// Public Route Table is the first return and Private Route Table is the second return.
+func (w Watcher) Create(ctx context.Context, namespace, name string, subnetsList []subnets.Subnet, igw *igws.InternetGateway, natgw *natgws.NATGateway) (*RouteTable, *RouteTable, error) {
+	privateSubnets := lo.Filter(subnetsList, func(subnet subnets.Subnet, _ int) bool { return !*subnet.MapPublicIpOnLaunch })
+	publicSubnets := lo.Filter(subnetsList, func(subnet subnets.Subnet, _ int) bool { return *subnet.MapPublicIpOnLaunch })
+	// PUBLIC SUBNET RESOURCES
+	var publicRouteTable *RouteTable
+	publicRawTags := tagutils.NamespacedTags(namespace, name)
+	publicRawTags["Name"] = fmt.Sprintf("%s-PUBLIC", publicRawTags["Name"])
+	publicTags := tagutils.MapToEC2Tags(publicRawTags)
+	var publicRouteTableOut *ec2.CreateRouteTableOutput
+	for i, publicSubnet := range publicSubnets {
+		if i == 0 {
+			var err error
+			publicRouteTableOut, err = w.routeTableAPI.CreateRouteTable(ctx, &ec2.CreateRouteTableInput{
+				VpcId: publicSubnet.VpcId,
+				TagSpecifications: []types.TagSpecification{
+					{
+						ResourceType: types.ResourceTypeRouteTable,
+						Tags:         publicTags,
+					},
+				},
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			publicRouteTable = &RouteTable{*publicRouteTableOut.RouteTable}
+			if igw != nil {
+				if _, err := w.routeTableAPI.CreateRoute(ctx, &ec2.CreateRouteInput{
+					RouteTableId:         publicRouteTable.RouteTableId,
+					DestinationCidrBlock: aws.String("0.0.0.0/0"),
+					GatewayId:            igw.InternetGatewayId,
+				}); err != nil {
+					return nil, nil, err
+				}
+			}
+		}
+		if _, err := w.routeTableAPI.AssociateRouteTable(ctx, &ec2.AssociateRouteTableInput{
+			RouteTableId: publicRouteTableOut.RouteTable.RouteTableId,
+			SubnetId:     publicSubnet.SubnetId,
+		}); err != nil {
+			return nil, nil, err
+		}
+	}
 
+	// PRIVATE SUBNET RESOURCES
+	var privateRouteTable *RouteTable
+	privateRawTags := tagutils.NamespacedTags(namespace, name)
+	privateRawTags["Name"] = fmt.Sprintf("%s-PRIVATE", privateRawTags["Name"])
+	privateTags := tagutils.MapToEC2Tags(privateRawTags)
+	var privateRouteTableOut *ec2.CreateRouteTableOutput
+	for i, privateSubnet := range privateSubnets {
+		if i == 0 {
+			var err error
+			privateRouteTableOut, err = w.routeTableAPI.CreateRouteTable(ctx, &ec2.CreateRouteTableInput{
+				VpcId: privateSubnet.VpcId,
+				TagSpecifications: []types.TagSpecification{
+					{
+						ResourceType: types.ResourceTypeRouteTable,
+						Tags:         privateTags,
+					},
+				},
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			privateRouteTable = &RouteTable{*privateRouteTableOut.RouteTable}
+			if natgw != nil {
+				if _, err := w.routeTableAPI.CreateRoute(ctx, &ec2.CreateRouteInput{
+					RouteTableId:         privateRouteTable.RouteTableId,
+					DestinationCidrBlock: aws.String("0.0.0.0/0"),
+					GatewayId:            natgw.NatGatewayId,
+				}); err != nil {
+					return nil, nil, err
+				}
+			}
+		}
+		if _, err := w.routeTableAPI.AssociateRouteTable(ctx, &ec2.AssociateRouteTableInput{
+			RouteTableId: privateRouteTableOut.RouteTable.RouteTableId,
+			SubnetId:     privateSubnet.SubnetId,
+		}); err != nil {
+			return nil, nil, err
+		}
+	}
+	return publicRouteTable, privateRouteTable, nil
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK

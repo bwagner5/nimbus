@@ -6,6 +6,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/bwagner5/nimbus/pkg/selectors"
 	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
@@ -23,6 +24,8 @@ type Watcher struct {
 // AWS SDK for Go v2 does not provide a single interface that combines all the necessary methods
 type SDKVPCsOps interface {
 	ec2.DescribeVpcsAPIClient
+	CreateVpc(context.Context, *ec2.CreateVpcInput, ...func(*ec2.Options)) (*ec2.CreateVpcOutput, error)
+	DeleteVpc(context.Context, *ec2.DeleteVpcInput, ...func(*ec2.Options)) (*ec2.DeleteVpcOutput, error)
 	DescribeAvailabilityZones(context.Context, *ec2.DescribeAvailabilityZonesInput, ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error)
 }
 
@@ -93,45 +96,27 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]VPC, erro
 	return vpcs, nil
 }
 
-func (w Watcher) CreateVPC(ctx context.Context, namespace, name string) (*vpc.Details, error) {
-	out, err := w.vpcAPI.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{})
-	if err != nil {
-		return nil, err
-	}
-	var subnets []vpc.CreateSubnetOptions
-	for i, zone := range lo.Subset(out.AvailabilityZones, 0, 3) {
-		subnets = append(subnets, vpc.CreateSubnetOptions{
-			AZ:     *zone.ZoneName,
-			CIDR:   fmt.Sprintf("10.0.%d.0/24", i),
-			Public: true,
-		})
-	}
-	vpcDetails, err := w.vpcctl.Create(ctx, vpc.CreateOptions{
-		Name:    fmt.Sprintf("%s/%s", namespace, name),
-		CIDR:    "10.0.0.0/16",
-		Subnets: subnets,
-		// vpcctl adds a Name tag, so we cant' use the tagutils.NamespacedTags func since it includes a Name tag as well
-		Tags: map[string]string{
-			tagutils.NamespaceTagKey: namespace,
-			tagutils.NameTagKey:      name,
-			tagutils.CreatedByTagKey: tagutils.SystemPrefixKey,
+func (w Watcher) Create(ctx context.Context, namespace string, name string, cidr string) (*VPC, error) {
+	vpcOut, err := w.vpcAPI.CreateVpc(ctx, &ec2.CreateVpcInput{
+		CidrBlock: aws.String(cidr),
+		TagSpecifications: []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeVpc,
+				Tags:         tagutils.EC2NamespacedTags(namespace, name),
+			},
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
-	return vpcDetails, nil
+	return &VPC{Vpc: *vpcOut.Vpc}, nil
 }
 
-func (w Watcher) DeleteVPC(ctx context.Context, namespace string, name string) error {
-	_, err := w.vpcctl.Delete(ctx, vpc.DeleteOptions{
-		Name:                   fmt.Sprintf("%s/%s", namespace, name),
-		DeleteUnownedResources: true,
+func (w Watcher) Delete(ctx context.Context, vpcID string) error {
+	_, err := w.vpcAPI.DeleteVpc(ctx, &ec2.DeleteVpcInput{
+		VpcId: &vpcID,
 	})
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK

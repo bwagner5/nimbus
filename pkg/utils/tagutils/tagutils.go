@@ -31,14 +31,7 @@ func NamespacedTags(namespace string, name string) map[string]string {
 
 func EC2NamespacedTags(namespace, name string) []ec2types.Tag {
 	tags := NamespacedTags(namespace, name)
-	var ec2Tags []ec2types.Tag
-	for k, v := range tags {
-		ec2Tags = append(ec2Tags, ec2types.Tag{
-			Key:   aws.String(k),
-			Value: aws.String(v),
-		})
-	}
-	return ec2Tags
+	return MapToEC2Tags(tags)
 }
 
 func EC2TagsToMap(ec2Tags []ec2types.Tag) map[string]string {
@@ -47,4 +40,15 @@ func EC2TagsToMap(ec2Tags []ec2types.Tag) map[string]string {
 		tags[lo.FromPtr(t.Key)] = lo.FromPtr(t.Value)
 	}
 	return tags
+}
+
+func MapToEC2Tags(tags map[string]string) []ec2types.Tag {
+	var ec2Tags []ec2types.Tag
+	for k, v := range tags {
+		ec2Tags = append(ec2Tags, ec2types.Tag{
+			Key:   aws.String(k),
+			Value: aws.String(v),
+		})
+	}
+	return ec2Tags
 }

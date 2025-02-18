@@ -6,9 +6,17 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/bwagner5/nimbus/pkg/providers/vpcs"
 	"github.com/bwagner5/nimbus/pkg/selectors"
+	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
 	"github.com/samber/lo"
+)
+
+const (
+	subnetTypePublic  = "PUBLIC"
+	subnetTypePrivate = "PRIVATE"
 )
 
 // Watcher discovers subnets based on selectors
@@ -20,6 +28,9 @@ type Watcher struct {
 // AWS SDK for Go v2 does not provide a single interface that combines all the necessary methods
 type SDKSubnetsOps interface {
 	ec2.DescribeSubnetsAPIClient
+	CreateSubnet(context.Context, *ec2.CreateSubnetInput, ...func(*ec2.Options)) (*ec2.CreateSubnetOutput, error)
+	DeleteSubnet(context.Context, *ec2.DeleteSubnetInput, ...func(*ec2.Options)) (*ec2.DeleteSubnetOutput, error)
+	ModifySubnetAttribute(context.Context, *ec2.ModifySubnetAttributeInput, ...func(*ec2.Options)) (*ec2.ModifySubnetAttributeOutput, error)
 }
 
 // Selector is a struct that represents a subnet selector
@@ -33,6 +44,13 @@ type Selector struct {
 // This is not the AWS SDK Subnet type, but a wrapper around it so that we can add additional data
 type Subnet struct {
 	ec2types.Subnet
+}
+
+// SubnetSpec is used to specify parameters for creating a subnet
+type SubnetSpec struct {
+	AZ     string
+	CIDR   string
+	Public bool
 }
 
 // ParseSelectors parses a string of selectors into a slice of Selector structs
@@ -86,6 +104,54 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]Subnet, e
 		}
 	}
 	return subnets, nil
+}
+
+func (w Watcher) Create(ctx context.Context, namespace, name string, vpc *vpcs.VPC, subnetSpecs []SubnetSpec) ([]Subnet, error) {
+	var subnetOutputs []*ec2.CreateSubnetOutput
+	// Create subnets
+	for _, subnet := range subnetSpecs {
+		subnetType := lo.Ternary(subnet.Public, subnetTypePublic, subnetTypePrivate)
+		subnetOutput, err := w.subnetAPI.CreateSubnet(ctx, &ec2.CreateSubnetInput{
+			VpcId:            vpc.VpcId,
+			AvailabilityZone: &subnet.AZ,
+			CidrBlock:        &subnet.CIDR,
+			TagSpecifications: []types.TagSpecification{{
+				ResourceType: types.ResourceTypeSubnet,
+				Tags:         tagutils.EC2NamespacedTags(namespace, name),
+			}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if subnetType == subnetTypePublic {
+			subnetOutput.Subnet.MapPublicIpOnLaunch = aws.Bool(true)
+		}
+		subnetOutputs = append(subnetOutputs, subnetOutput)
+	}
+	// Modify any subnet attributes that we can't set on creation
+	for _, subnet := range subnetOutputs {
+		subnetOpts, ok := lo.Find(subnetSpecs, func(subnetSpec SubnetSpec) bool { return subnetSpec.CIDR == *subnet.Subnet.CidrBlock })
+		if !ok {
+			return nil, fmt.Errorf("unable to find SubnetSpec for subnet %s - %s", *subnet.Subnet.AvailabilityZone, *subnet.Subnet.CidrBlock)
+		}
+		// Can only modify 1 subnet attribute at a time
+		if subnetOpts.Public {
+			if _, err := w.subnetAPI.ModifySubnetAttribute(ctx, &ec2.ModifySubnetAttributeInput{
+				SubnetId:            subnet.Subnet.SubnetId,
+				MapPublicIpOnLaunch: &types.AttributeBooleanValue{Value: aws.Bool(true)},
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return lo.Map(subnetOutputs, func(out *ec2.CreateSubnetOutput, _ int) Subnet { return Subnet{Subnet: *out.Subnet} }), nil
+}
+
+func (w Watcher) Delete(ctx context.Context, subnetID string) error {
+	_, err := w.subnetAPI.DeleteSubnet(ctx, &ec2.DeleteSubnetInput{
+		SubnetId: &subnetID,
+	})
+	return err
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK

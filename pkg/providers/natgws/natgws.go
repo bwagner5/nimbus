@@ -1,20 +1,21 @@
-package igws
+package natgws
 
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	"github.com/bwagner5/nimbus/pkg/providers/vpcs"
+	"github.com/bwagner5/nimbus/pkg/providers/subnets"
 	"github.com/bwagner5/nimbus/pkg/selectors"
 	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
 	"github.com/samber/lo"
 )
 
-// Watcher discovers Internet Gateways based on selectors
+// Watcher discovers NAT Gateways based on selectors
 type Watcher struct {
 	ec2API SDKIGWOps
 }
@@ -22,29 +23,29 @@ type Watcher struct {
 // SDKIGWOps is an interface that combines the necessary EC2 SDK client interfaces
 // AWS SDK for Go v2 does not provide a single interface that combines all the necessary methods
 type SDKIGWOps interface {
-	ec2.DescribeInternetGatewaysAPIClient
-	CreateInternetGateway(context.Context, *ec2.CreateInternetGatewayInput, ...func(*ec2.Options)) (*ec2.CreateInternetGatewayOutput, error)
-	AttachInternetGateway(context.Context, *ec2.AttachInternetGatewayInput, ...func(*ec2.Options)) (*ec2.AttachInternetGatewayOutput, error)
+	ec2.DescribeNatGatewaysAPIClient
+	CreateNatGateway(context.Context, *ec2.CreateNatGatewayInput, ...func(*ec2.Options)) (*ec2.CreateNatGatewayOutput, error)
+	AllocateAddress(context.Context, *ec2.AllocateAddressInput, ...func(*ec2.Options)) (*ec2.AllocateAddressOutput, error)
 }
 
-// Selector is a struct that represents an Internet Gateway selector
+// Selector is a struct that represents a NAT Gateway selector
 type Selector struct {
 	Tags  map[string]string
 	ID    string
 	VPCID string
 }
 
-// InternetGateway represent an AWS Internet Gateway
-// This is not the AWS SDK InternetGateway type, but a wrapper around it so that we can add additional data
-type InternetGateway struct {
-	ec2types.InternetGateway
+// NATGateway represent an AWS NAT Gateway
+// This is not the AWS SDK NatGateway type, but a wrapper around it so that we can add additional data
+type NATGateway struct {
+	ec2types.NatGateway
 }
 
 // ParseSelectors parses a string of selectors into a slice of Selector structs
 func ParseSelectors(selectorStr string) ([]Selector, error) {
 	selectors, err := selectors.ParseSelectorsTokens(selectorStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Internet Gateway selectors: %w", err)
+		return nil, fmt.Errorf("failed to parse NAT Gateway selectors: %w", err)
 	}
 	internetGatewaySelectors := make([]Selector, 0, len(selectors))
 	for _, selector := range selectors {
@@ -56,7 +57,7 @@ func ParseSelectors(selectorStr string) ([]Selector, error) {
 			case "id":
 				internetGatewaySelector.ID = v
 			default:
-				return nil, fmt.Errorf("invalid Internet Gateway selector key: %s", k)
+				return nil, fmt.Errorf("invalid NAT Gateway selector key: %s", k)
 			}
 		}
 		internetGatewaySelectors = append(internetGatewaySelectors, internetGatewaySelector)
@@ -71,13 +72,13 @@ func NewWatcher(ec2API SDKIGWOps) Watcher {
 	}
 }
 
-// Resolve returns a list of igws that match the provided selectors
+// Resolve returns a list of NAT Gateways that match the provided selectors
 // Multiple calls to EC2 may be sent to resolve the selectors
-func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]InternetGateway, error) {
-	var igws []InternetGateway
+func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]NATGateway, error) {
+	var natgws []NATGateway
 	for _, filters := range filterSets(selectors) {
-		pager := ec2.NewDescribeInternetGatewaysPaginator(w.ec2API, &ec2.DescribeInternetGatewaysInput{
-			Filters: filters,
+		pager := ec2.NewDescribeNatGatewaysPaginator(w.ec2API, &ec2.DescribeNatGatewaysInput{
+			Filter: filters,
 		})
 		for pager.HasMorePages() {
 			page, err := pager.NextPage(ctx)
@@ -85,19 +86,25 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]InternetG
 				return nil, fmt.Errorf("failed to describe Internet Gateways: %w", err)
 			}
 
-			igws = append(igws, lo.Map(page.InternetGateways, func(sdkInternetGateway ec2types.InternetGateway, _ int) InternetGateway {
-				return InternetGateway{sdkInternetGateway}
+			natgws = append(natgws, lo.Map(page.NatGateways, func(sdkNATGateway ec2types.NatGateway, _ int) NATGateway {
+				return NATGateway{sdkNATGateway}
 			})...)
 		}
 	}
-	return igws, nil
+	return natgws, nil
 }
 
-func (w Watcher) Create(ctx context.Context, namespace, name string, vpc vpcs.VPC) (*InternetGateway, error) {
-	igwOut, err := w.ec2API.CreateInternetGateway(ctx, &ec2.CreateInternetGatewayInput{
+func (w Watcher) Create(ctx context.Context, namespace, name string, subnetsList []subnets.Subnet) (*NATGateway, error) {
+	privateSubnets := lo.Filter(subnetsList, func(subnet subnets.Subnet, _ int) bool { return !*subnet.MapPublicIpOnLaunch })
+	// do not create a NATGW if there are no private subnets
+	if len(privateSubnets) == 0 {
+		return nil, nil
+	}
+	publicSubnets := lo.Filter(subnetsList, func(subnet subnets.Subnet, _ int) bool { return *subnet.MapPublicIpOnLaunch })
+	eipOut, err := w.ec2API.AllocateAddress(ctx, &ec2.AllocateAddressInput{
 		TagSpecifications: []types.TagSpecification{
 			{
-				ResourceType: types.ResourceTypeInternetGateway,
+				ResourceType: types.ResourceTypeElasticIp,
 				Tags:         tagutils.EC2NamespacedTags(namespace, name),
 			},
 		},
@@ -105,26 +112,37 @@ func (w Watcher) Create(ctx context.Context, namespace, name string, vpc vpcs.VP
 	if err != nil {
 		return nil, err
 	}
-	if _, err := w.ec2API.AttachInternetGateway(ctx, &ec2.AttachInternetGatewayInput{
-		InternetGatewayId: igwOut.InternetGateway.InternetGatewayId,
-		VpcId:             vpc.VpcId,
-	}); err != nil {
-		return &InternetGateway{*igwOut.InternetGateway}, err
+	natGWOut, err := w.ec2API.CreateNatGateway(ctx, &ec2.CreateNatGatewayInput{
+		AllocationId: eipOut.AllocationId,
+		SubnetId:     publicSubnets[0].SubnetId,
+		TagSpecifications: []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeNatgateway,
+				Tags:         tagutils.EC2NamespacedTags(namespace, name),
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
 	}
-	return &InternetGateway{*igwOut.InternetGateway}, nil
+	waiter := ec2.NewNatGatewayAvailableWaiter(w.ec2API)
+	if err := waiter.Wait(ctx, &ec2.DescribeNatGatewaysInput{NatGatewayIds: []string{*natGWOut.NatGateway.NatGatewayId}}, 5*time.Minute); err != nil {
+		return &NATGateway{*natGWOut.NatGateway}, err
+	}
+	return &NATGateway{*natGWOut.NatGateway}, nil
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK
 func filterSets(selectors []Selector) [][]ec2types.Filter {
 	var filterResult [][]ec2types.Filter
-	idFilter := ec2types.Filter{Name: aws.String("internet-gateway-id")}
+	idFilter := ec2types.Filter{Name: aws.String("nat-gateway-id")}
 	for _, term := range selectors {
 		switch {
 		case term.ID != "":
 			idFilter.Values = append(idFilter.Values, term.ID)
 		case term.VPCID != "":
 			filterResult = append(filterResult, []ec2types.Filter{{
-				Name:   aws.String("attachment.vpc-id"),
+				Name:   aws.String("vpc-id"),
 				Values: []string{term.VPCID},
 			}})
 		default:
