@@ -366,7 +366,7 @@ func (v AWSVM) Delete(ctx context.Context, deletionPlan plans.DeletionPlan) (pla
 		if deletionPlan.Status.InternetGateways[*igw.InternetGatewayId] {
 			continue
 		}
-		if err := v.igwWatcher.Delete(ctx, *igw.InternetGatewayId); err != nil {
+		if err := v.igwWatcher.Delete(ctx, igw); err != nil {
 			return deletionPlan, err
 		}
 		if deletionPlan.Status.InternetGateways == nil {
@@ -379,7 +379,7 @@ func (v AWSVM) Delete(ctx context.Context, deletionPlan plans.DeletionPlan) (pla
 		if deletionPlan.Status.RouteTables[*routeTable.RouteTableId] {
 			continue
 		}
-		if err := v.routeTableWatcher.Delete(ctx, *routeTable.RouteTableId); err != nil {
+		if err := v.routeTableWatcher.Delete(ctx, routeTable); err != nil {
 			return deletionPlan, err
 		}
 		if deletionPlan.Status.RouteTables == nil {

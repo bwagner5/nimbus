@@ -24,7 +24,9 @@ type Watcher struct {
 type SDKIGWOps interface {
 	ec2.DescribeInternetGatewaysAPIClient
 	CreateInternetGateway(context.Context, *ec2.CreateInternetGatewayInput, ...func(*ec2.Options)) (*ec2.CreateInternetGatewayOutput, error)
+	DeleteInternetGateway(context.Context, *ec2.DeleteInternetGatewayInput, ...func(*ec2.Options)) (*ec2.DeleteInternetGatewayOutput, error)
 	AttachInternetGateway(context.Context, *ec2.AttachInternetGatewayInput, ...func(*ec2.Options)) (*ec2.AttachInternetGatewayOutput, error)
+	DetachInternetGateway(context.Context, *ec2.DetachInternetGatewayInput, ...func(*ec2.Options)) (*ec2.DetachInternetGatewayOutput, error)
 }
 
 // Selector is a struct that represents an Internet Gateway selector
@@ -112,6 +114,22 @@ func (w Watcher) Create(ctx context.Context, namespace, name string, vpc vpcs.VP
 		return &InternetGateway{*igwOut.InternetGateway}, err
 	}
 	return &InternetGateway{*igwOut.InternetGateway}, nil
+}
+
+func (w Watcher) Delete(ctx context.Context, igw InternetGateway) error {
+	for _, attachment := range igw.Attachments {
+		_, err := w.ec2API.DetachInternetGateway(ctx, &ec2.DetachInternetGatewayInput{
+			InternetGatewayId: igw.InternetGatewayId,
+			VpcId:             attachment.VpcId,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	_, err := w.ec2API.DeleteInternetGateway(ctx, &ec2.DeleteInternetGatewayInput{
+		InternetGatewayId: igw.InternetGatewayId,
+	})
+	return err
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK

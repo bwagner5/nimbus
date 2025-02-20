@@ -3,6 +3,7 @@ package routetables
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -28,7 +29,9 @@ type SDKRouteTablesOps interface {
 	CreateRouteTable(context.Context, *ec2.CreateRouteTableInput, ...func(*ec2.Options)) (*ec2.CreateRouteTableOutput, error)
 	DeleteRouteTable(context.Context, *ec2.DeleteRouteTableInput, ...func(*ec2.Options)) (*ec2.DeleteRouteTableOutput, error)
 	AssociateRouteTable(context.Context, *ec2.AssociateRouteTableInput, ...func(*ec2.Options)) (*ec2.AssociateRouteTableOutput, error)
+	DisassociateRouteTable(context.Context, *ec2.DisassociateRouteTableInput, ...func(*ec2.Options)) (*ec2.DisassociateRouteTableOutput, error)
 	CreateRoute(context.Context, *ec2.CreateRouteInput, ...func(*ec2.Options)) (*ec2.CreateRouteOutput, error)
+	DeleteRoute(context.Context, *ec2.DeleteRouteInput, ...func(*ec2.Options)) (*ec2.DeleteRouteOutput, error)
 }
 
 // Selector is a struct that represents a routeTable selector
@@ -186,6 +189,28 @@ func (w Watcher) Create(ctx context.Context, namespace, name string, subnetsList
 		}
 	}
 	return publicRouteTable, privateRouteTable, nil
+}
+
+func (w Watcher) Delete(ctx context.Context, routeTable RouteTable) error {
+	for _, route := range routeTable.Routes {
+		if route.GatewayId != nil && strings.HasPrefix(*route.GatewayId, "igw-") {
+			if _, err := w.routeTableAPI.DeleteRoute(ctx, &ec2.DeleteRouteInput{
+				RouteTableId:         routeTable.RouteTableId,
+				DestinationCidrBlock: route.DestinationCidrBlock,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	for _, association := range routeTable.Associations {
+		if _, err := w.routeTableAPI.DisassociateRouteTable(ctx, &ec2.DisassociateRouteTableInput{AssociationId: association.RouteTableAssociationId}); err != nil {
+			return err
+		}
+	}
+	if _, err := w.routeTableAPI.DeleteRouteTable(ctx, &ec2.DeleteRouteTableInput{RouteTableId: routeTable.RouteTableId}); err != nil {
+		return err
+	}
+	return nil
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK
