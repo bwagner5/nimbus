@@ -107,6 +107,9 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]Subnet, e
 }
 
 func (w Watcher) Create(ctx context.Context, namespace, name string, vpc *vpcs.VPC, subnetSpecs []SubnetSpec) ([]Subnet, error) {
+	if len(subnetSpecs) == 0 {
+		return nil, fmt.Errorf("no subnet specs received")
+	}
 	var subnetOutputs []*ec2.CreateSubnetOutput
 	// Create subnets
 	for _, subnet := range subnetSpecs {

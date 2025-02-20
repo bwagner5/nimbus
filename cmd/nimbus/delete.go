@@ -17,11 +17,14 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
+	"github.com/bwagner5/nimbus/pkg/logging"
 	"github.com/bwagner5/nimbus/pkg/pretty"
 	"github.com/bwagner5/nimbus/pkg/vm"
+	"github.com/samber/lo"
 	"github.com/spf13/cobra"
 )
 
@@ -44,7 +47,10 @@ var (
 		Long:  `delete`,
 		Args:  cobra.MinimumNArgs(0),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return delete(cmd.Context(), deleteOptions, globalOpts)
+			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+				Level: lo.Ternary(globalOpts.Verbose, slog.LevelDebug, slog.LevelInfo),
+			}))
+			return delete(logging.ToContext(cmd.Context(), logger), deleteOptions, globalOpts)
 		},
 	}
 )

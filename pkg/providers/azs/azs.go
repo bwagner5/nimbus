@@ -24,9 +24,10 @@ type SDKAvailabilityZoneOps interface {
 
 // Selector is a struct that represents a security group selector
 type Selector struct {
-	Tags map[string]string
-	Name string
-	ID   string
+	Tags   map[string]string
+	Name   string
+	ID     string
+	Region string
 }
 
 type CreateAvailabilityZoneOpts struct {
@@ -101,6 +102,11 @@ func filterSets(selectors []Selector) [][]ec2types.Filter {
 			idFilter.Values = append(idFilter.Values, term.ID)
 		case term.Name != "":
 			nameFilter.Values = append(nameFilter.Values, term.Name)
+		case term.Region != "":
+			filterResult = append(filterResult, []ec2types.Filter{{
+				Name:   aws.String("region-name"),
+				Values: []string{term.Region},
+			}})
 		default:
 			var filters []ec2types.Filter
 			for k, v := range term.Tags {

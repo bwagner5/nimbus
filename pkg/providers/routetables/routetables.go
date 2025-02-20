@@ -109,6 +109,9 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]RouteTabl
 func (w Watcher) Create(ctx context.Context, namespace, name string, subnetsList []subnets.Subnet, igw *igws.InternetGateway, natgw *natgws.NATGateway) (*RouteTable, *RouteTable, error) {
 	privateSubnets := lo.Filter(subnetsList, func(subnet subnets.Subnet, _ int) bool { return !*subnet.MapPublicIpOnLaunch })
 	publicSubnets := lo.Filter(subnetsList, func(subnet subnets.Subnet, _ int) bool { return *subnet.MapPublicIpOnLaunch })
+	if len(subnetsList) == 0 {
+		return nil, nil, fmt.Errorf("no subnets received")
+	}
 	// PUBLIC SUBNET RESOURCES
 	var publicRouteTable *RouteTable
 	publicRawTags := tagutils.NamespacedTags(namespace, name)
