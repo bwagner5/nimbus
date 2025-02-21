@@ -150,34 +150,26 @@ func (w Watcher) DeleteLaunchTemplate(ctx context.Context, launchTemplateID stri
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK
-func filterSets(selectors []Selector) [][]ec2types.Filter {
+// Each filter is executed as a separate list call.
+// Terms within a Selector are AND'd and between Selectors are OR'd
+func filterSets(selectorList []Selector) [][]ec2types.Filter {
 	var filterResult [][]ec2types.Filter
-	for _, term := range selectors {
-		switch {
-		case term.Name != "":
-			filterResult = append(filterResult, []ec2types.Filter{
-				{
-					Name:   aws.String("launch-template-name"),
-					Values: []string{term.Name},
-				},
+	for _, term := range selectorList {
+		filters := []ec2types.Filter{}
+		if term.ID != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("launch-template-id"),
+				Values: []string{term.ID},
 			})
-		default:
-			var filters []ec2types.Filter
-			for k, v := range term.Tags {
-				if v == "*" || v == "" {
-					filters = append(filters, ec2types.Filter{
-						Name:   aws.String("tag-key"),
-						Values: []string{k},
-					})
-				} else {
-					filters = append(filters, ec2types.Filter{
-						Name:   aws.String(fmt.Sprintf("tag:%s", k)),
-						Values: []string{v},
-					})
-				}
-			}
-			filterResult = append(filterResult, filters)
 		}
+		if term.Name != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("launch-template-name"),
+				Values: []string{term.Name},
+			})
+		}
+		filters = append(filters, selectors.TagsToEC2Filters(term.Tags)...)
+		filterResult = append(filterResult, filters)
 	}
 	return filterResult
 }

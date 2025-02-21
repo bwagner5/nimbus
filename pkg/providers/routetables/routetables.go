@@ -217,38 +217,26 @@ func (w Watcher) Delete(ctx context.Context, routeTable RouteTable) error {
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK
-func filterSets(selectors []Selector) [][]ec2types.Filter {
+// Each filter is executed as a separate list call.
+// Terms within a Selector are AND'd and between Selectors are OR'd
+func filterSets(selectorList []Selector) [][]ec2types.Filter {
 	var filterResult [][]ec2types.Filter
-	idFilter := ec2types.Filter{Name: aws.String("route-table-id")}
-	for _, term := range selectors {
-		switch {
-		case term.ID != "":
-			idFilter.Values = append(idFilter.Values, term.ID)
-		case term.VPCID != "":
-			filterResult = append(filterResult, []ec2types.Filter{{
+	for _, term := range selectorList {
+		filters := []ec2types.Filter{}
+		if term.ID != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("route-table-id"),
+				Values: []string{term.ID},
+			})
+		}
+		if term.VPCID != "" {
+			filters = append(filters, ec2types.Filter{
 				Name:   aws.String("vpc-id"),
 				Values: []string{term.VPCID},
-			}})
-		default:
-			var filters []ec2types.Filter
-			for k, v := range term.Tags {
-				if v == "*" || v == "" {
-					filters = append(filters, ec2types.Filter{
-						Name:   aws.String("tag-key"),
-						Values: []string{k},
-					})
-				} else {
-					filters = append(filters, ec2types.Filter{
-						Name:   aws.String(fmt.Sprintf("tag:%s", k)),
-						Values: []string{v},
-					})
-				}
-			}
-			filterResult = append(filterResult, filters)
+			})
 		}
-	}
-	if len(idFilter.Values) > 0 {
-		filterResult = append(filterResult, []ec2types.Filter{idFilter})
+		filters = append(filters, selectors.TagsToEC2Filters(term.Tags)...)
+		filterResult = append(filterResult, filters)
 	}
 	return filterResult
 }

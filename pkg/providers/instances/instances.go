@@ -3,6 +3,7 @@ package instances
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -96,44 +97,41 @@ func (w Watcher) TerminateInstance(ctx context.Context, instanceID string) error
 	if err != nil {
 		return err
 	}
+	// wait for instance to go into terminated
+	// this is required for other resources to delete cleanly
+	for range time.NewTicker(2 * time.Second).C {
+		termiantedInstances, err := w.Resolve(ctx, []Selector{{ID: instanceID, State: "terminated"}})
+		if err != nil {
+			return err
+		}
+		if len(termiantedInstances) > 0 {
+			break
+		}
+	}
 	return nil
 }
 
 // filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK
-func filterSets(selectors []Selector) [][]ec2types.Filter {
+// Each filter is executed as a separate list call.
+// Terms within a Selector are AND'd and between Selectors are OR'd
+func filterSets(selectorList []Selector) [][]ec2types.Filter {
 	var filterResult [][]ec2types.Filter
-	idFilter := ec2types.Filter{Name: aws.String("instance-id")}
-	for _, term := range selectors {
-		switch {
-		case term.ID != "":
-			idFilter.Values = append(idFilter.Values, term.ID)
-		case term.State != "":
-			filterResult = append(filterResult, []ec2types.Filter{
-				{
-					Name:   aws.String("instance-state-name"),
-					Values: []string{term.State},
-				},
+	for _, term := range selectorList {
+		filters := []ec2types.Filter{}
+		if term.ID != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("instance-id"),
+				Values: []string{term.ID},
 			})
-		default:
-			var filters []ec2types.Filter
-			for k, v := range term.Tags {
-				if v == "*" || v == "" {
-					filters = append(filters, ec2types.Filter{
-						Name:   aws.String("tag-key"),
-						Values: []string{k},
-					})
-				} else {
-					filters = append(filters, ec2types.Filter{
-						Name:   aws.String(fmt.Sprintf("tag:%s", k)),
-						Values: []string{v},
-					})
-				}
-			}
-			filterResult = append(filterResult, filters)
 		}
-	}
-	if len(idFilter.Values) > 0 {
-		filterResult = append(filterResult, []ec2types.Filter{idFilter})
+		if term.State != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("instance-state-name"),
+				Values: []string{term.State},
+			})
+		}
+		filters = append(filters, selectors.TagsToEC2Filters(term.Tags)...)
+		filterResult = append(filterResult, filters)
 	}
 	return filterResult
 }

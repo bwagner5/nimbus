@@ -3,6 +3,9 @@ package selectors
 import (
 	"fmt"
 	"strings"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
 // GenericSelector is a struct that represents a set of selectors
@@ -89,4 +92,22 @@ func ParseSelectorsTokens(selectors string) ([]GenericSelector, error) {
 		genericSelectors = append(genericSelectors, genericSelector)
 	}
 	return genericSelectors, nil
+}
+
+func TagsToEC2Filters(tags map[string]string) []ec2types.Filter {
+	var filters []ec2types.Filter
+	for k, v := range tags {
+		if v == "*" || v == "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("tag-key"),
+				Values: []string{k},
+			})
+		} else {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String(fmt.Sprintf("tag:%s", k)),
+				Values: []string{v},
+			})
+		}
+	}
+	return filters
 }

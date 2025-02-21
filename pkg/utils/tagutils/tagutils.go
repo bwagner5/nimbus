@@ -29,11 +29,14 @@ func NamespacedTags(namespace string, name string) map[string]string {
 	return tags
 }
 
+// EC2NamespacedTags returns the standard tags for namepaced name items in the EC2 tag format
+// name is optional
 func EC2NamespacedTags(namespace, name string) []ec2types.Tag {
 	tags := NamespacedTags(namespace, name)
 	return MapToEC2Tags(tags)
 }
 
+// EC2TagsToMap converts EC2 typed tags to simple key/value strings in a map
 func EC2TagsToMap(ec2Tags []ec2types.Tag) map[string]string {
 	tags := map[string]string{}
 	for _, t := range ec2Tags {
@@ -42,6 +45,7 @@ func EC2TagsToMap(ec2Tags []ec2types.Tag) map[string]string {
 	return tags
 }
 
+// MapToEC2Tags takes simple key/value strings in a map and converts them to EC2 tag types
 func MapToEC2Tags(tags map[string]string) []ec2types.Tag {
 	var ec2Tags []ec2types.Tag
 	for k, v := range tags {

@@ -199,60 +199,46 @@ func (w Watcher) Resolve(ctx context.Context, selectors []Selector) ([]AMI, erro
 	return amis, nil
 }
 
-func filterSets(selectors []Selector) [][]ec2types.Filter {
-	idFilter := ec2types.Filter{Name: aws.String("image-id")}
+// filterSets converts a slice of selectors into a slice of filters for use with the AWS SDK
+// Each filter is executed as a separate list call.
+// Terms within a Selector are AND'd and between Selectors are OR'd
+func filterSets(selectorList []Selector) [][]ec2types.Filter {
 	var filterResult [][]ec2types.Filter
-	for _, term := range selectors {
-		switch {
-		case term.ID != "":
-			idFilter.Values = append(idFilter.Values, term.ID)
-		default:
-			var filters []ec2types.Filter
-
-			if term.OwnerID == "" {
-				filters = append(filters, ec2types.Filter{
-					Name:   aws.String("owner-alias"),
-					Values: []string{"self", "amazon"},
-				})
-			} else {
-				filters = append(filters, ec2types.Filter{
-					Name:   aws.String("owner-id"),
-					Values: []string{term.OwnerID},
-				})
-			}
-
-			if term.Name != "" {
-				filters = append(filters, ec2types.Filter{
-					Name:   aws.String("name"),
-					Values: []string{term.Name},
-				})
-			}
-
-			if term.Architecture != "" {
-				filters = append(filters, ec2types.Filter{
-					Name:   aws.String("architecture"),
-					Values: []string{term.Architecture},
-				})
-			}
-
-			for k, v := range term.Tags {
-				if v == "*" || v == "" {
-					filters = append(filters, ec2types.Filter{
-						Name:   aws.String("tag-key"),
-						Values: []string{k},
-					})
-				} else {
-					filters = append(filters, ec2types.Filter{
-						Name:   aws.String(fmt.Sprintf("tag:%s", k)),
-						Values: []string{v},
-					})
-				}
-			}
-			filterResult = append(filterResult, filters)
+	for _, term := range selectorList {
+		filters := []ec2types.Filter{}
+		if term.ID != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("image-id"),
+				Values: []string{term.ID},
+			})
 		}
-	}
-	if len(idFilter.Values) > 0 {
-		filterResult = append(filterResult, []ec2types.Filter{idFilter})
+		if term.OwnerID != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("owner-alias"),
+				Values: []string{term.OwnerID},
+			})
+		} else {
+			// THIS CASE IS VERY IMPORANT TO PREVENT WhoAMI attack
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("owner-alias"),
+				Values: []string{"self", "amazon"},
+			})
+		}
+		if term.Name != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("name"),
+				Values: []string{term.Name},
+			})
+		}
+		if term.Architecture != "" {
+			filters = append(filters, ec2types.Filter{
+				Name:   aws.String("architecture"),
+				Values: []string{term.Architecture},
+			})
+		}
+
+		filters = append(filters, selectors.TagsToEC2Filters(term.Tags)...)
+		filterResult = append(filterResult, filters)
 	}
 	return filterResult
 }
