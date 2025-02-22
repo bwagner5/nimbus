@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/bwagner5/nimbus/pkg/logging"
 	"github.com/bwagner5/nimbus/pkg/pretty"
 	"github.com/bwagner5/nimbus/pkg/providers/instances"
 	"github.com/bwagner5/nimbus/pkg/tui"
@@ -38,7 +39,8 @@ var (
 		Long:  `get`,
 		Args:  cobra.MinimumNArgs(0),
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return get(cmd.Context(), getOptions, globalOpts)
+			ctx := logging.ToContext(cmd.Context(), logging.DefaultLogger(globalOpts.Verbose))
+			return get(ctx, getOptions, globalOpts)
 		},
 	}
 )
@@ -61,9 +63,9 @@ func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) e
 		return err
 	}
 
-	instancesUI := lo.FilterMap(instanceList, func(instance instances.Instance, _ int) (instances.PretyInstance, bool) {
+	instancesUI := lo.FilterMap(instanceList, func(instance instances.Instance, _ int) (instances.PrettyInstance, bool) {
 		if instance.State.Name == ec2types.InstanceStateNameTerminated {
-			return instances.PretyInstance{}, false
+			return instances.PrettyInstance{}, false
 		}
 		return instance.Prettify(), true
 	})
@@ -78,7 +80,7 @@ func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) e
 	case OutputTableWide:
 		fmt.Println(pretty.Table(instancesUI, true))
 	case OutputInteractive:
-		return tui.Launch(ctx, vmClient, globalOpts.Namespace, launchOptions.Name)
+		return tui.Launch(ctx, vmClient, globalOpts.Namespace, launchOptions.Name, globalOpts.Verbose)
 	}
 	return nil
 }

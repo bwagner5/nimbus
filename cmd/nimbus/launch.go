@@ -16,8 +16,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
-	"os"
 
 	"github.com/bwagner5/nimbus/pkg/logging"
 	"github.com/bwagner5/nimbus/pkg/plans"
@@ -27,7 +25,6 @@ import (
 	"github.com/bwagner5/nimbus/pkg/providers/securitygroups"
 	"github.com/bwagner5/nimbus/pkg/providers/subnets"
 	"github.com/bwagner5/nimbus/pkg/vm"
-	"github.com/samber/lo"
 	"github.com/spf13/cobra"
 )
 
@@ -51,10 +48,8 @@ var (
 		Long:  `launch`,
 		Args:  cobra.MinimumNArgs(0),
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-				Level: lo.Ternary(globalOpts.Verbose, slog.LevelDebug, slog.LevelInfo),
-			}))
-			return launch(logging.ToContext(cmd.Context(), logger), launchOptions, globalOpts)
+			ctx := logging.ToContext(cmd.Context(), logging.DefaultLogger(globalOpts.Verbose))
+			return launch(ctx, launchOptions, globalOpts)
 		},
 	}
 )

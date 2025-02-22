@@ -16,11 +16,14 @@ var (
 )
 
 // NamespacedTags returns a map of tag key/value pairs in standardized way.
-// name is optional to get tags back for a selector
+// name is optional
+// namespace is optional
 func NamespacedTags(namespace string, name string) map[string]string {
 	tags := map[string]string{
-		NamespaceTagKey: namespace,
 		CreatedByTagKey: SystemPrefixKey,
+	}
+	if namespace != "" {
+		tags[NamespaceTagKey] = namespace
 	}
 	if name != "" {
 		tags["Name"] = fmt.Sprintf("%s/%s", namespace, name)

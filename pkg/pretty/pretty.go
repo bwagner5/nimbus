@@ -3,12 +3,18 @@ package pretty
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/table"
 	"github.com/olekukonko/tablewriter"
 	"gopkg.in/yaml.v2"
 )
+
+type Prettifier[T any] interface {
+	Prettify() T
+}
 
 // EncodeJSON takes any struct data and prints it in a pretty JSON format
 func EncodeJSON(data any) string {
@@ -67,7 +73,7 @@ func EncodeYAML(data any) string {
 // FIELD 1     FIELD 2
 // test1       test2
 func Table[T any](data []T, wide bool) string {
-	headers, rows := HeadersAndRow(data, wide)
+	headers, rows := HeadersAndRows(data, wide)
 	out := bytes.Buffer{}
 	table := tablewriter.NewWriter(&out)
 	table.SetHeader(headers)
@@ -88,7 +94,7 @@ func Table[T any](data []T, wide bool) string {
 }
 
 // HeadersAndRows is a helper to retrieve the headers and the rows from a slice of tagged structs
-func HeadersAndRow[T any](data []T, wide bool) ([]string, [][]string) {
+func HeadersAndRows[T any](data []T, wide bool) ([]string, [][]string) {
 	var headers []string
 	var rows [][]string
 	for _, dataRow := range data {
@@ -112,4 +118,31 @@ func HeadersAndRow[T any](data []T, wide bool) ([]string, [][]string) {
 		rows = append(rows, row)
 	}
 	return headers, rows
+}
+
+func HeadersAndRowToStruct(headers []table.Column, row []string, result any) error {
+	typeOfT := reflect.TypeOf(result).Elem()
+	if typeOfT.Kind() != reflect.Struct {
+		return errors.New("result must be a pointer to a struct")
+	}
+
+	if len(headers) != len(row) {
+		return errors.New("headers and row must have the same length")
+	}
+
+	valueOfT := reflect.ValueOf(result).Elem()
+
+	for i, header := range headers {
+		for j := 0; j < typeOfT.NumField(); j++ {
+			field := typeOfT.Field(j)
+			if field.Tag.Get("table") == header.Title {
+				fieldValue := valueOfT.Field(j)
+				if fieldValue.CanSet() {
+					fieldValue.SetString(row[i])
+				}
+			}
+		}
+	}
+
+	return nil
 }

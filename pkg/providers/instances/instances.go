@@ -41,7 +41,7 @@ type Instance struct {
 }
 
 // PrettyInstance represents an instance for UI elements like the static and TUI tables
-type PretyInstance struct {
+type PrettyInstance struct {
 	Name         string `table:"Name"`
 	Status       string `table:"Status"`
 	IAMRole      string `table:"Role"`
@@ -151,12 +151,12 @@ func filterSets(selectorList []Selector) [][]ec2types.Filter {
 	return filterResult
 }
 
-func (i Instance) Prettify() PretyInstance {
+func (i Instance) Prettify() PrettyInstance {
 	instanceProfileID := ""
 	if i.IamInstanceProfile != nil {
 		instanceProfileID = strings.Split(*i.IamInstanceProfile.Arn, "/")[1]
 	}
-	return PretyInstance{
+	return PrettyInstance{
 		Name:         tagutils.EC2TagsToMap(i.Tags)["Name"],
 		Status:       string(i.State.Name),
 		IAMRole:      instanceProfileID,
@@ -167,4 +167,12 @@ func (i Instance) Prettify() PretyInstance {
 		CapacityType: string(i.InstanceLifecycle),
 		InstanceID:   lo.FromPtr(i.InstanceId),
 	}
+}
+
+func (i Instance) Name() string {
+	return tagutils.EC2TagsToMap(i.Tags)[tagutils.NameTagKey]
+}
+
+func (i Instance) Namespace() string {
+	return tagutils.EC2TagsToMap(i.Tags)[tagutils.NamespaceTagKey]
 }
