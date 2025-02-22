@@ -29,10 +29,11 @@ import (
 )
 
 const (
-	OutputYAML       = "yaml"
-	OutputJSON       = "json"
-	OutputTableShort = "short"
-	OutputTableWide  = "wide"
+	OutputYAML        = "yaml"
+	OutputJSON        = "json"
+	OutputTableShort  = "short"
+	OutputTableWide   = "wide"
+	OutputInteractive = "interactive"
 )
 
 var (
@@ -77,7 +78,7 @@ func main() {
 	rootCmd.PersistentFlags().BoolVar(&globalOpts.Verbose, "verbose", false, "Verbose output")
 	rootCmd.PersistentFlags().BoolVar(&globalOpts.Version, "version", false, "version")
 	rootCmd.PersistentFlags().StringVarP(&globalOpts.Output, "output", "o", OutputTableShort,
-		fmt.Sprintf("Output mode: %v", []string{OutputTableShort, OutputTableWide, OutputYAML, OutputJSON}))
+		fmt.Sprintf("Output mode: %v", []string{OutputTableShort, OutputTableWide, OutputYAML, OutputJSON, OutputInteractive}))
 	rootCmd.PersistentFlags().StringVarP(&globalOpts.ConfigFile, "file", "f", "", "YAML Config File")
 
 	rootCmd.PersistentFlags().StringVarP(&globalOpts.Namespace, "namespace", "n", "", "Logical grouping of resources. All resources are tagged with the namespace.")

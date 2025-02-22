@@ -16,13 +16,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/bwagner5/nimbus/pkg/pretty"
 	"github.com/bwagner5/nimbus/pkg/providers/instances"
-	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
+	"github.com/bwagner5/nimbus/pkg/tui"
 	"github.com/bwagner5/nimbus/pkg/vm"
 	"github.com/samber/lo"
 	"github.com/spf13/cobra"
@@ -30,18 +28,6 @@ import (
 
 type GetOptions struct {
 	Name string `table:"Name"`
-}
-
-type GetUI struct {
-	Name         string `table:"Name"`
-	Status       string `table:"Status"`
-	IAMRole      string `table:"Role"`
-	Age          string `table:"Age"`
-	Arch         string `table:"Arch"`
-	InstanceType string `table:"Instance-Type"`
-	Zone         string `table:"Zone"`
-	CapacityType string `table:"Capacity-Type"`
-	InstanceID   string `table:"ID"`
 }
 
 var (
@@ -68,16 +54,18 @@ func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) e
 		return err
 	}
 
-	instanceList, err := vm.New(awsCfg).List(ctx, globalOpts.Namespace, getOptions.Name)
+	vmClient := vm.New(awsCfg)
+
+	instanceList, err := vmClient.List(ctx, globalOpts.Namespace, getOptions.Name)
 	if err != nil {
 		return err
 	}
 
-	instancesUI := lo.FilterMap(instanceList, func(instance instances.Instance, _ int) (GetUI, bool) {
+	instancesUI := lo.FilterMap(instanceList, func(instance instances.Instance, _ int) (instances.PretyInstance, bool) {
 		if instance.State.Name == ec2types.InstanceStateNameTerminated {
-			return GetUI{}, false
+			return instances.PretyInstance{}, false
 		}
-		return instanceToGetUI(instance), true
+		return instance.Prettify(), true
 	})
 
 	switch globalOpts.Output {
@@ -89,26 +77,8 @@ func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) e
 		fmt.Println(pretty.Table(instancesUI, false))
 	case OutputTableWide:
 		fmt.Println(pretty.Table(instancesUI, true))
+	case OutputInteractive:
+		return tui.Launch(ctx, vmClient, globalOpts.Namespace, launchOptions.Name)
 	}
 	return nil
-}
-
-// TODO: may want to add a type to instance that abstracts some of this basic info so that the TUI is similar
-// It would be nice to not need two types between the sdk, cli, and tui
-func instanceToGetUI(instance instances.Instance) GetUI {
-	instanceProfileID := ""
-	if instance.IamInstanceProfile != nil {
-		instanceProfileID = strings.Split(*instance.IamInstanceProfile.Arn, "/")[1]
-	}
-	return GetUI{
-		Name:         tagutils.EC2TagsToMap(instance.Tags)["Name"],
-		Status:       string(instance.State.Name),
-		IAMRole:      instanceProfileID,
-		Age:          time.Since(lo.FromPtr(instance.LaunchTime)).Truncate(time.Second).String(),
-		Arch:         string(instance.Architecture),
-		InstanceType: string(instance.InstanceType),
-		Zone:         lo.FromPtr(instance.Placement.AvailabilityZone),
-		CapacityType: string(instance.InstanceLifecycle),
-		InstanceID:   lo.FromPtr(instance.InstanceId),
-	}
 }

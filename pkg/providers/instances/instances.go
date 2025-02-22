@@ -3,12 +3,14 @@ package instances
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/bwagner5/nimbus/pkg/selectors"
+	"github.com/bwagner5/nimbus/pkg/utils/tagutils"
 	"github.com/samber/lo"
 )
 
@@ -36,6 +38,19 @@ type Selector struct {
 // This is not the AWS SDK Instance type, but a wrapper around it so that we can add additional data
 type Instance struct {
 	ec2types.Instance
+}
+
+// PrettyInstance represents an instance for UI elements like the static and TUI tables
+type PretyInstance struct {
+	Name         string `table:"Name"`
+	Status       string `table:"Status"`
+	IAMRole      string `table:"Role"`
+	Age          string `table:"Age"`
+	Arch         string `table:"Arch"`
+	InstanceType string `table:"Instance-Type"`
+	Zone         string `table:"Zone"`
+	CapacityType string `table:"Capacity-Type"`
+	InstanceID   string `table:"ID"`
 }
 
 // ParseSelectors parses a string of selectors into a slice of Selector structs
@@ -134,4 +149,22 @@ func filterSets(selectorList []Selector) [][]ec2types.Filter {
 		filterResult = append(filterResult, filters)
 	}
 	return filterResult
+}
+
+func (i Instance) Prettify() PretyInstance {
+	instanceProfileID := ""
+	if i.IamInstanceProfile != nil {
+		instanceProfileID = strings.Split(*i.IamInstanceProfile.Arn, "/")[1]
+	}
+	return PretyInstance{
+		Name:         tagutils.EC2TagsToMap(i.Tags)["Name"],
+		Status:       string(i.State.Name),
+		IAMRole:      instanceProfileID,
+		Age:          time.Since(lo.FromPtr(i.LaunchTime)).Truncate(time.Second).String(),
+		Arch:         string(i.Architecture),
+		InstanceType: string(i.InstanceType),
+		Zone:         lo.FromPtr(i.Placement.AvailabilityZone),
+		CapacityType: string(i.InstanceLifecycle),
+		InstanceID:   lo.FromPtr(i.InstanceId),
+	}
 }

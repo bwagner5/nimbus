@@ -67,6 +67,28 @@ func EncodeYAML(data any) string {
 // FIELD 1     FIELD 2
 // test1       test2
 func Table[T any](data []T, wide bool) string {
+	headers, rows := HeadersAndRow(data, wide)
+	out := bytes.Buffer{}
+	table := tablewriter.NewWriter(&out)
+	table.SetHeader(headers)
+	table.SetAutoWrapText(false)
+	table.SetAutoFormatHeaders(true)
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetCenterSeparator("")
+	table.SetColumnSeparator("")
+	table.SetRowSeparator("")
+	table.SetHeaderLine(false)
+	table.SetBorder(false)
+	table.SetTablePadding("\t") // pad with tabs
+	table.SetNoWhiteSpace(true)
+	table.AppendBulk(rows) // Add Bulk Data
+	table.Render()
+	return out.String()
+}
+
+// HeadersAndRows is a helper to retrieve the headers and the rows from a slice of tagged structs
+func HeadersAndRow[T any](data []T, wide bool) ([]string, [][]string) {
 	var headers []string
 	var rows [][]string
 	for _, dataRow := range data {
@@ -89,21 +111,5 @@ func Table[T any](data []T, wide bool) string {
 		}
 		rows = append(rows, row)
 	}
-	out := bytes.Buffer{}
-	table := tablewriter.NewWriter(&out)
-	table.SetHeader(headers)
-	table.SetAutoWrapText(false)
-	table.SetAutoFormatHeaders(true)
-	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetCenterSeparator("")
-	table.SetColumnSeparator("")
-	table.SetRowSeparator("")
-	table.SetHeaderLine(false)
-	table.SetBorder(false)
-	table.SetTablePadding("\t") // pad with tabs
-	table.SetNoWhiteSpace(true)
-	table.AppendBulk(rows) // Add Bulk Data
-	table.Render()
-	return out.String()
+	return headers, rows
 }
