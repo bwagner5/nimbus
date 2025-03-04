@@ -27,9 +27,10 @@ import (
 )
 
 type VMI interface {
-	Launch(context.Context, plans.LaunchPlan) (plans.LaunchPlan, error)
-	Describe(context.Context)
-	Terminate(context.Context)
+	List(ctx context.Context, namespace string, name string) ([]instances.Instance, error)
+	Launch(context.Context, bool, plans.LaunchPlan) (plans.LaunchPlan, error)
+	DeletionPlan(ctx context.Context, namespace, name string) (plans.DeletionPlan, error)
+	Delete(context.Context, plans.DeletionPlan) (plans.DeletionPlan, error)
 }
 
 type AWSVM struct {
