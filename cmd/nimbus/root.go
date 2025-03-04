@@ -23,6 +23,8 @@ import (
 	"dario.cat/mergo"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/bwagner5/nimbus/pkg/tui"
+	"github.com/bwagner5/nimbus/pkg/vm"
 	"github.com/samber/lo"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -60,11 +62,8 @@ var (
 	rootCmd    = &cobra.Command{
 		Use:     "vm",
 		Version: version,
-		Run: func(cmd *cobra.Command, args []string) {
-			if rootOpts.Attribution {
-				fmt.Println(attribution)
-				os.Exit(0)
-			}
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return root(cmd.Context(), globalOpts)
 		},
 	}
 )
@@ -89,6 +88,24 @@ func main() {
 	cobra.EnableCommandSorting = false
 
 	lo.Must0(rootCmd.Execute())
+}
+
+func root(ctx context.Context, globalOpts GlobalOptions) error {
+	if rootOpts.Attribution {
+		fmt.Println(attribution)
+		return nil
+	}
+	awsCfg, err := AWSConfig(ctx, globalOpts)
+	if err != nil {
+		return err
+	}
+
+	vmClient := vm.New(awsCfg)
+
+	if globalOpts.Output == OutputInteractive {
+		return tui.Launch(ctx, vmClient, "get", globalOpts.Namespace, getOptions.Name, globalOpts.Verbose)
+	}
+	return nil
 }
 
 func ParseConfig[T any](globalOpts GlobalOptions, opts T) (T, error) {

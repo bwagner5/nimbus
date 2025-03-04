@@ -102,7 +102,7 @@ func (m ListModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		// Launch
 		case "l":
-			return launch.NewLaunch(m.ctx, m.vmClient, m, m.width, m.height), nil
+			return launch.NewLaunch(m.ctx, m.vmClient, m), tea.WindowSize()
 
 		case "?":
 			m.help.ShowAll = !m.help.ShowAll

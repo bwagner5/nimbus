@@ -58,6 +58,10 @@ func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) e
 
 	vmClient := vm.New(awsCfg)
 
+	if globalOpts.Output == OutputInteractive {
+		return tui.Launch(ctx, vmClient, "get", globalOpts.Namespace, getOptions.Name, globalOpts.Verbose)
+	}
+
 	instanceList, err := vmClient.List(ctx, globalOpts.Namespace, getOptions.Name)
 	if err != nil {
 		return err
@@ -79,8 +83,6 @@ func get(ctx context.Context, getOptions GetOptions, globalOpts GlobalOptions) e
 		fmt.Println(pretty.Table(instancesUI, false))
 	case OutputTableWide:
 		fmt.Println(pretty.Table(instancesUI, true))
-	case OutputInteractive:
-		return tui.Launch(ctx, vmClient, globalOpts.Namespace, launchOptions.Name, globalOpts.Verbose)
 	}
 	return nil
 }

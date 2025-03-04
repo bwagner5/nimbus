@@ -9,19 +9,17 @@ import (
 )
 
 type launchModel struct {
-	ctx       context.Context
-	vmClient  vm.VMI
-	backModel tea.Model
-	form      *huh.Form
-	width     int
-	height    int
+	ctx      context.Context
+	vmClient vm.VMI
+	prev     tea.Model
+	form     *huh.Form
 }
 
-func NewLaunch(ctx context.Context, vmClient vm.VMI, backModel tea.Model, width, height int) launchModel {
-	return launchModel{
-		ctx:       ctx,
-		vmClient:  vmClient,
-		backModel: backModel,
+func NewLaunch(ctx context.Context, vmClient vm.VMI, prev tea.Model) *launchModel {
+	return &launchModel{
+		ctx:      ctx,
+		vmClient: vmClient,
+		prev:     prev,
 		form: huh.NewForm(
 			huh.NewGroup(
 				huh.NewInput().Title("Name"),
@@ -30,7 +28,7 @@ func NewLaunch(ctx context.Context, vmClient vm.VMI, backModel tea.Model, width,
 					Options(huh.NewOptions("Spot", "On-Demand")...).
 					Title("Choose a Capacity Type"),
 			).WithHide(false).Title("Launch Instance"),
-		).WithWidth(width).WithHeight(height),
+		),
 	}
 }
 
@@ -43,9 +41,7 @@ func (m launchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		// This is only triggered if its the first model or on a resize
-		m.width = msg.Width
-		m.height = msg.Height
-		m.form = m.form.WithWidth(msg.Width).WithHeight(msg.Height)
+		m.form = m.form.WithWidth(msg.Width).WithHeight(msg.Height - 1)
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -54,18 +50,17 @@ func (m launchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q":
 			return m, tea.Quit
 		case "esc":
-			return m.backModel, nil
+			return m.prev, nil
 		}
 	}
 
 	form, cmd := m.form.Update(msg)
 	if f, ok := form.(*huh.Form); ok {
 		m.form = f
-
 	}
 
 	if m.form.State == huh.StateCompleted {
-		return m.backModel, nil
+		return m.prev, nil
 	}
 	return m, cmd
 }

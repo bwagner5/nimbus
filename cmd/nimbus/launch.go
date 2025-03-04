@@ -24,6 +24,7 @@ import (
 	"github.com/bwagner5/nimbus/pkg/providers/instancetypes"
 	"github.com/bwagner5/nimbus/pkg/providers/securitygroups"
 	"github.com/bwagner5/nimbus/pkg/providers/subnets"
+	"github.com/bwagner5/nimbus/pkg/tui"
 	"github.com/bwagner5/nimbus/pkg/vm"
 	"github.com/spf13/cobra"
 )
@@ -73,6 +74,12 @@ func launch(ctx context.Context, launchOptions LaunchOptions, globalOpts GlobalO
 		return err
 	}
 
+	vmClient := vm.New(awsCfg)
+
+	if globalOpts.Output == OutputInteractive {
+		return tui.Launch(ctx, vmClient, "launch", globalOpts.Namespace, getOptions.Name, globalOpts.Verbose)
+	}
+
 	subnetSelectors, err := subnets.ParseSelectors(launchOptions.SubnetSelector)
 	if err != nil {
 		return err
@@ -105,7 +112,7 @@ func launch(ctx context.Context, launchOptions LaunchOptions, globalOpts GlobalO
 		},
 	}
 
-	launchPlan, err := vm.New(awsCfg).Launch(ctx, launchOptions.DryRun, launchPlanInput)
+	launchPlan, err := vmClient.Launch(ctx, launchOptions.DryRun, launchPlanInput)
 	if err != nil {
 		if globalOpts.Verbose {
 			fmt.Println(pretty.EncodeYAML(launchPlan))
