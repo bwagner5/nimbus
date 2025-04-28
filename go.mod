@@ -5,7 +5,7 @@ go 1.24
 require (
 	dario.cat/mergo v1.0.1
 	github.com/aws/amazon-ec2-instance-selector/v3 v3.1.0
-	github.com/aws/aws-sdk-go-v2 v1.36.1
+	github.com/aws/aws-sdk-go-v2 v1.36.3
 	github.com/aws/aws-sdk-go-v2/config v1.29.6
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.203.0
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.56.12
