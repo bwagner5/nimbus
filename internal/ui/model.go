@@ -83,7 +83,10 @@ type Model struct {
 	refreshGen     int
 }
 
-type resourcesMsg []resources.Resource
+type resourcesMsg struct {
+	resources []resources.Resource
+	region    string // if set, replaces all resources for this region
+}
 type regionsMsg []string
 type partialMsg struct {
 	resources []resources.Resource
@@ -99,6 +102,7 @@ type sshCredentialsMsg struct {
 	ip       string
 	err      error
 }
+type createDoneMsg struct{}
 
 func NewModel() Model {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -139,7 +143,7 @@ func (m Model) fetchRegionOnly(region string) tea.Cmd {
 	ctx := m.ctx
 	return func() tea.Msg {
 		res, _ := provider.Fetch(ctx, region)
-		return resourcesMsg(res)
+		return resourcesMsg{resources: res, region: region}
 	}
 }
 
@@ -182,7 +186,7 @@ func (m Model) fetchResources() tea.Cmd {
 		if err != nil {
 			return errMsg(err)
 		}
-		return resourcesMsg(res)
+		return resourcesMsg{resources: res}
 	}
 }
 
@@ -225,7 +229,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case resourcesMsg:
-		m.resources = m.mergeResources(msg)
+		m.resources = m.mergeResources(msg.resources, msg.region)
 		m.loading, m.err, m.progress = false, nil, ""
 		m.checkPollSettled()
 		m.applyFilter()
@@ -241,7 +245,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if !msg.done {
-			m.resources = m.mergeResources(msg.resources)
+			m.resources = m.mergeResources(msg.resources, "")
 			m.applyFilter()
 			m.progress = fmt.Sprintf("Loading... %d/%d regions", msg.completed, msg.total)
 			// Continue to next region
@@ -256,6 +260,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case CreateResult:
 		if m.createScreen != nil {
 			m.createScreen, _ = m.createScreen.Update(msg)
+			if m.createScreen.IsComplete() {
+				return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return createDoneMsg{} })
+			}
+		}
+	case createDoneMsg:
+		if m.view == viewCreate && m.createScreen != nil && m.createScreen.IsComplete() {
+			m.view = viewResources
+			m.createScreen = nil
+			m.loading = true
+			m.resources = nil
+			return m, m.fetchResources()
 		}
 	case bundlesMsg, blueprintsMsg:
 		if m.createScreen != nil {
@@ -478,7 +493,35 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) mergeResources(incoming []resources.Resource) []resources.Resource {
+func (m *Model) mergeResources(incoming []resources.Resource, region string) []resources.Resource {
+	if region != "" {
+		// Scoped refresh: replace all entries for this region
+		incomingIDs := make(map[string]bool, len(incoming))
+		for _, r := range incoming {
+			incomingIDs[r.ID()] = true
+		}
+		// Keep entries from other regions, drop stale ones from this region
+		var kept []resources.Resource
+		for _, r := range m.resources {
+			if r.Region() != region || incomingIDs[r.ID()] {
+				kept = append(kept, r)
+			}
+		}
+		// Update existing and add new
+		idx := make(map[string]int, len(kept))
+		for i, r := range kept {
+			idx[r.ID()] = i
+		}
+		for _, r := range incoming {
+			if i, ok := idx[r.ID()]; ok {
+				kept[i] = r
+			} else {
+				kept = append(kept, r)
+			}
+		}
+		return kept
+	}
+	// Full refresh: merge without removal
 	idx := make(map[string]int, len(m.resources))
 	merged := make([]resources.Resource, len(m.resources))
 	copy(merged, m.resources)

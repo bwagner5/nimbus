@@ -202,7 +202,7 @@ func (s *CreateInstanceScreen) bundleOptions(platform, networking string) []Opti
 
 		opts = append(opts, Option{
 			Value:       id,
-			Label:       formatBundleName(id),
+			Label:       formatBundleName(b),
 			Description: desc,
 			Price:       price,
 		})
@@ -219,13 +219,22 @@ func (s *CreateInstanceScreen) bundleOptions(platform, networking string) []Opti
 	return opts
 }
 
-func formatBundleName(id string) string {
-	parts := strings.Split(id, "_")
-	if len(parts) > 0 {
-		name := parts[0]
-		return strings.ToUpper(name[:1]) + name[1:]
+func formatBundleName(b types.Bundle) string {
+	name := ""
+	if b.Name != nil {
+		name = *b.Name
+	} else {
+		name = *b.BundleId
 	}
-	return id
+	id := *b.BundleId
+	switch {
+	case strings.HasPrefix(id, "c_"):
+		return name + " (Compute)"
+	case strings.HasPrefix(id, "m_"):
+		return name + " (Memory)"
+	default:
+		return name
+	}
 }
 
 func (s *CreateInstanceScreen) blueprintOptions(platform, imageType string) []Option {

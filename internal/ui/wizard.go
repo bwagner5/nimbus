@@ -82,7 +82,8 @@ func NewWizard(title string, steps []Step) *Wizard {
 		case StepTextArea:
 			ta := textarea.New()
 			ta.Placeholder = "Enter script or leave empty..."
-			ta.SetWidth(60)
+			ta.Prompt = ""
+			ta.SetWidth(56)
 			ta.SetHeight(6)
 			ta.ShowLineNumbers = false
 			steps[i].textArea = ta
@@ -325,7 +326,7 @@ func (w *Wizard) renderStep(step *Step) string {
 	case StepText, StepFilePicker:
 		b.WriteString("  " + step.textInput.View())
 	case StepTextArea:
-		b.WriteString("  " + step.textArea.View())
+		b.WriteString(step.textArea.View())
 	}
 
 	return b.String()
