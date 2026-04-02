@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 	"github.com/wagnerbm/nimbusv2/internal/resources"
+
+	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 )
 
 type view int
@@ -20,6 +23,34 @@ const (
 	viewProviders
 	viewFilter
 	viewCreate
+	viewConfirm
+)
+
+type actionKind int
+
+const (
+	actionStop actionKind = iota
+	actionStart
+	actionDelete
+)
+
+type confirmAction struct {
+	kind     actionKind
+	name     string
+	region   string
+}
+
+type actionResultMsg struct {
+	err    error
+	msg    string
+	region string
+}
+
+type refreshTickMsg struct{ gen int }
+
+const (
+	refreshNormal = 30 * time.Second
+	refreshFast   = 5 * time.Second
 )
 
 type Model struct {
@@ -44,6 +75,9 @@ type Model struct {
 	cancel         context.CancelFunc
 	createScreen   *CreateInstanceScreen
 	toast          Toast
+	confirm        *confirmAction
+	pollRegion     string
+	refreshGen     int
 }
 
 type resourcesMsg []resources.Resource
@@ -78,7 +112,42 @@ func NewModel() Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.fetchResources(), m.fetchRegions())
+	return tea.Batch(m.fetchResources(), m.fetchRegions(), m.scheduleRefresh())
+}
+
+func (m Model) scheduleRefresh() tea.Cmd {
+	gen := m.refreshGen
+	d := refreshNormal
+	if m.pollRegion != "" {
+		d = refreshFast
+	}
+	return tea.Tick(d, func(time.Time) tea.Msg { return refreshTickMsg{gen: gen} })
+}
+
+func (m Model) fetchRegionOnly(region string) tea.Cmd {
+	provider := m.providers[m.providerIdx]
+	ctx := m.ctx
+	return func() tea.Msg {
+		res, _ := provider.Fetch(ctx, region)
+		return resourcesMsg(res)
+	}
+}
+
+func (m *Model) checkPollSettled() {
+	if m.pollRegion == "" {
+		return
+	}
+	for _, r := range m.resources {
+		if r.Region() != m.pollRegion {
+			continue
+		}
+		switch r.Status() {
+		case "running", "stopped", "terminated", "available":
+		default:
+			return
+		}
+	}
+	m.pollRegion = ""
 }
 
 func (m Model) fetchRegions() tea.Cmd {
@@ -146,8 +215,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case resourcesMsg:
-		m.resources, m.loading, m.err, m.progress = msg, false, nil, ""
+		m.resources = m.mergeResources(msg)
+		m.loading, m.err, m.progress = false, nil, ""
+		m.checkPollSettled()
 		m.applyFilter()
+		m.refreshGen++
+		return m, m.scheduleRefresh()
 	case regionsMsg:
 		m.regions = msg
 	case streamRegionsCmd:
@@ -158,7 +231,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if !msg.done {
-			m.resources = append(m.resources, msg.resources...)
+			m.resources = m.mergeResources(msg.resources)
 			m.applyFilter()
 			m.progress = fmt.Sprintf("Loading... %d/%d regions", msg.completed, msg.total)
 			// Continue to next region
@@ -185,6 +258,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case toastExpireMsg:
 		m.toast = Toast{}
+	case refreshTickMsg:
+		if msg.gen != m.refreshGen {
+			return m, nil
+		}
+		if m.view != viewCreate {
+			if m.pollRegion != "" {
+				return m, m.fetchRegionOnly(m.pollRegion)
+			}
+			return m, m.fetchResources()
+		}
+		m.refreshGen++
+		return m, m.scheduleRefresh()
+	case actionResultMsg:
+		if msg.err != nil {
+			m.toast = NewToast([]string{msg.err.Error()})
+		} else {
+			m.toast = NewToast([]string{msg.msg})
+			m.pollRegion = msg.region
+		}
+		m.refreshGen++
+		return m, tea.Batch(m.fetchRegionOnly(msg.region), m.scheduleRefresh(), ScheduleToastExpiry())
 	case errMsg:
 		m.toast = NewToast([]string{msg.Error()})
 		m.loading, m.progress = false, ""
@@ -208,6 +302,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.fetchResources()
 		}
 		return m, cmd
+	}
+
+	// Handle confirm modal
+	if m.view == viewConfirm && m.confirm != nil {
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("y"))):
+			action := *m.confirm
+			m.confirm = nil
+			m.view = viewResources
+			return m, m.executeAction(action)
+		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
+			m.confirm = nil
+			m.view = viewResources
+		}
+		return m, nil
 	}
 
 	// Handle filter input mode
@@ -309,8 +418,42 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.view = viewCreate
 			return m, m.createScreen.Init()
 		}
+	case key.Matches(msg, key.NewBinding(key.WithKeys("s"))):
+		if m.view == viewResources && m.providers[m.providerIdx].Kind() == "lightsail/instances" && len(m.filtered) > 0 {
+			r := m.filtered[m.cursor]
+			kind := actionStop
+			if r.Status() == "stopped" {
+				kind = actionStart
+			}
+			m.confirm = &confirmAction{kind: kind, name: r.Name(), region: r.Region()}
+			m.view = viewConfirm
+		}
+	case key.Matches(msg, key.NewBinding(key.WithKeys("d"))):
+		if m.view == viewResources && m.providers[m.providerIdx].Kind() == "lightsail/instances" && len(m.filtered) > 0 {
+			r := m.filtered[m.cursor]
+			m.confirm = &confirmAction{kind: actionDelete, name: r.Name(), region: r.Region()}
+			m.view = viewConfirm
+		}
 	}
 	return m, nil
+}
+
+func (m *Model) mergeResources(incoming []resources.Resource) []resources.Resource {
+	idx := make(map[string]int, len(m.resources))
+	merged := make([]resources.Resource, len(m.resources))
+	copy(merged, m.resources)
+	for i, r := range merged {
+		idx[r.ID()] = i
+	}
+	for _, r := range incoming {
+		if i, ok := idx[r.ID()]; ok {
+			merged[i] = r
+		} else {
+			idx[r.ID()] = len(merged)
+			merged = append(merged, r)
+		}
+	}
+	return merged
 }
 
 func (m *Model) applyFilter() {
@@ -344,6 +487,8 @@ func (m Model) View() string {
 			screen = m.overlay(base, m.renderRegionModal())
 		case viewProviders:
 			screen = m.overlay(base, m.renderProviderModal())
+		case viewConfirm:
+			screen = m.overlay(base, m.renderConfirmModal())
 		default:
 			screen = base
 		}
@@ -542,6 +687,48 @@ func placeOverlay(width, height int, bg, modal string) string {
 	return strings.Join(bgLines[:height], "\n")
 }
 
+func (m Model) executeAction(a confirmAction) tea.Cmd {
+	ctx := m.ctx
+	client := m.client
+	return func() tea.Msg {
+		svc := lightsail.NewFromConfig(client.WithRegion(a.region).Config())
+		switch a.kind {
+		case actionStop:
+			_, err := svc.StopInstance(ctx, &lightsail.StopInstanceInput{InstanceName: &a.name})
+			if err != nil {
+				return actionResultMsg{err: fmt.Errorf("stop %s: %w", a.name, err), region: a.region}
+			}
+			return actionResultMsg{msg: fmt.Sprintf("Instance '%s' stopping", a.name), region: a.region}
+		case actionStart:
+			_, err := svc.StartInstance(ctx, &lightsail.StartInstanceInput{InstanceName: &a.name})
+			if err != nil {
+				return actionResultMsg{err: fmt.Errorf("start %s: %w", a.name, err), region: a.region}
+			}
+			return actionResultMsg{msg: fmt.Sprintf("Instance '%s' starting", a.name), region: a.region}
+		case actionDelete:
+			_, err := svc.DeleteInstance(ctx, &lightsail.DeleteInstanceInput{InstanceName: &a.name})
+			if err != nil {
+				return actionResultMsg{err: fmt.Errorf("delete %s: %w", a.name, err), region: a.region}
+			}
+			return actionResultMsg{msg: fmt.Sprintf("Instance '%s' deleted", a.name), region: a.region}
+		}
+		return nil
+	}
+}
+
+func (m Model) renderConfirmModal() string {
+	var b strings.Builder
+	action := "Stop"
+	if m.confirm.kind == actionDelete {
+		action = "Delete"
+	} else if m.confirm.kind == actionStart {
+		action = "Start"
+	}
+	b.WriteString(ErrorStyle.Render(fmt.Sprintf(" %s instance '%s'? ", action, m.confirm.name)) + "\n\n")
+	b.WriteString(HelpStyle.Render(" y:confirm  n/esc:cancel "))
+	return b.String()
+}
+
 func (m Model) renderResources() string {
 	var b strings.Builder
 	provider := m.providers[m.providerIdx]
@@ -573,7 +760,11 @@ func (m Model) renderResources() string {
 		b.WriteString(HelpStyle.Render("  No resources found\n"))
 	}
 
-	help := " q:quit  /:filter  ::resources  r:regions  c:create  R:refresh  j/k:navigate "
+	sLabel := "s:stop"
+	if len(m.filtered) > 0 && m.cursor < len(m.filtered) && m.filtered[m.cursor].Status() == "stopped" {
+		sLabel = "s:start"
+	}
+	help := fmt.Sprintf(" q:quit  /:filter  ::resources  r:regions  c:create  %s  d:delete  R:refresh  j/k:navigate ", sLabel)
 	if m.progress != "" {
 		help = " " + m.progress + " │" + help
 	}
