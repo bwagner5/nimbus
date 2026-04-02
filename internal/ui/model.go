@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/wagnerbm/nimbusv2/internal/resources"
 
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
+	"github.com/aws/aws-sdk-go-v2/service/lightsail/types"
 )
 
 type view int
@@ -89,6 +92,13 @@ type partialMsg struct {
 	completed int
 }
 type errMsg error
+type sshExitMsg struct{ err error }
+type sshCredentialsMsg struct {
+	keyPath  string
+	username string
+	ip       string
+	err      error
+}
 
 func NewModel() Model {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -283,6 +293,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.toast = NewToast([]string{msg.Error()})
 		m.loading, m.progress = false, ""
 		return m, ScheduleToastExpiry()
+	case sshExitMsg:
+		if msg.err != nil {
+			m.toast = NewToast([]string{msg.err.Error()})
+			return m, ScheduleToastExpiry()
+		}
+		return m, nil
+	case sshCredentialsMsg:
+		if msg.err != nil {
+			m.toast = NewToast([]string{msg.err.Error()})
+			return m, ScheduleToastExpiry()
+		}
+		c := exec.Command("ssh",
+			"-i", msg.keyPath,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			fmt.Sprintf("%s@%s", msg.username, msg.ip),
+		)
+		keyPath := msg.keyPath
+		return m, tea.ExecProcess(c, func(err error) tea.Msg {
+			os.Remove(keyPath)
+			os.Remove(keyPath + "-cert.pub")
+			return sshExitMsg{err: err}
+		})
 	}
 	return m, nil
 }
@@ -433,6 +466,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			r := m.filtered[m.cursor]
 			m.confirm = &confirmAction{kind: actionDelete, name: r.Name(), region: r.Region()}
 			m.view = viewConfirm
+		}
+	case key.Matches(msg, key.NewBinding(key.WithKeys("x"))):
+		if m.view == viewResources && m.providers[m.providerIdx].Kind() == "lightsail/instances" && len(m.filtered) > 0 {
+			r := m.filtered[m.cursor]
+			if r.Status() == "running" {
+				return m, m.sshInto(r.Name(), r.Region())
+			}
 		}
 	}
 	return m, nil
@@ -716,6 +756,37 @@ func (m Model) executeAction(a confirmAction) tea.Cmd {
 	}
 }
 
+func (m Model) sshInto(name, region string) tea.Cmd {
+	ctx := m.ctx
+	client := m.client
+	return func() tea.Msg {
+		svc := lightsail.NewFromConfig(client.WithRegion(region).Config())
+		out, err := svc.GetInstanceAccessDetails(ctx, &lightsail.GetInstanceAccessDetailsInput{
+			InstanceName: &name,
+			Protocol:     types.InstanceAccessProtocolSsh,
+		})
+		if err != nil {
+			return sshCredentialsMsg{err: fmt.Errorf("get access details: %w", err)}
+		}
+		d := out.AccessDetails
+
+		keyFile, err := os.CreateTemp("", "nimbus-ssh-*")
+		if err != nil {
+			return sshCredentialsMsg{err: err}
+		}
+		keyPath := keyFile.Name()
+		keyFile.Chmod(0600)
+		keyFile.WriteString(*d.PrivateKey)
+		keyFile.Close()
+
+		if d.CertKey != nil && *d.CertKey != "" {
+			os.WriteFile(keyPath+"-cert.pub", []byte(*d.CertKey), 0600)
+		}
+
+		return sshCredentialsMsg{keyPath: keyPath, username: *d.Username, ip: *d.IpAddress}
+	}
+}
+
 func (m Model) renderConfirmModal() string {
 	var b strings.Builder
 	action := "Stop"
@@ -764,7 +835,7 @@ func (m Model) renderResources() string {
 	if len(m.filtered) > 0 && m.cursor < len(m.filtered) && m.filtered[m.cursor].Status() == "stopped" {
 		sLabel = "s:start"
 	}
-	help := fmt.Sprintf(" q:quit  /:filter  ::resources  r:regions  c:create  %s  d:delete  R:refresh  j/k:navigate ", sLabel)
+	help := fmt.Sprintf(" q:quit  /:filter  ::resources  r:regions  c:create  %s  d:delete  x:shell  R:refresh  j/k:navigate ", sLabel)
 	if m.progress != "" {
 		help = " " + m.progress + " │" + help
 	}
