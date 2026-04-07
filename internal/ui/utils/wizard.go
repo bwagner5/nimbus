@@ -3,11 +3,11 @@ package utils
 import (
 	"strings"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // StepType defines the type of wizard step
@@ -80,7 +80,7 @@ func NewWizard(title string, steps []Step) *Wizard {
 				ti.Placeholder = "Enter value..."
 			}
 			ti.CharLimit = 64
-			ti.Width = 40
+			ti.SetWidth(40)
 			steps[i].textInput = ti
 		case StepTextArea:
 			ta := textarea.New()
@@ -94,7 +94,7 @@ func NewWizard(title string, steps []Step) *Wizard {
 			ti := textinput.New()
 			ti.Placeholder = "Enter file path..."
 			ti.CharLimit = 256
-			ti.Width = 50
+			ti.SetWidth(50)
 			steps[i].textInput = ti
 		}
 		if steps[i].skipLabel == "" && steps[i].Optional {
@@ -143,7 +143,7 @@ func (w *Wizard) Update(msg tea.Msg) (*Wizard, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		// For textarea steps, only intercept esc/ctrl+c/tab — let everything else through
 		if step.Type == StepTextArea && !w.reviewing {
 			switch {

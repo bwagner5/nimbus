@@ -9,7 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail/types"
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 	"github.com/wagnerbm/nimbusv2/internal/ui/utils"
 )
@@ -302,7 +302,7 @@ func (s *CreateScreen) blueprintOptions(platform, imageType string) []utils.Opti
 
 func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if s.result != nil && !s.result.Success {
 			if msg.String() == "esc" || msg.String() == "ctrl+c" {
 				s.wizard.SetCancelled()

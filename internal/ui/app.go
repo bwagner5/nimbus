@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 	"github.com/wagnerbm/nimbusv2/internal/resources"
 	"github.com/wagnerbm/nimbusv2/internal/trace"
@@ -132,7 +132,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		m.trace.Log("msg=KeyMsg key=%q view=%s", msg.String(), m.view)
 		return m.handleKey(msg)
 
@@ -284,7 +284,7 @@ func (m Model) handleRefreshTick(msg instances.RefreshTickMsg) (tea.Model, tea.C
 
 // --- Key handling ---
 
-func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Delegate to active sub-screen
 	if m.view == viewCreate && m.createScreen != nil {
 		var cmd tea.Cmd
@@ -377,9 +377,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEsc:
+func (m Model) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.Code {
+	case tea.KeyEscape:
 		m.view = viewResources
 		m.filter = ""
 		m.applyFilter()
@@ -391,8 +391,8 @@ func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.applyFilter()
 		}
 	default:
-		if msg.Type == tea.KeyRunes {
-			m.filter += string(msg.Runes)
+		if len(msg.Text) > 0 {
+			m.filter += msg.Text
 			m.applyFilter()
 		}
 	}
@@ -515,7 +515,7 @@ func (m *Model) applyFilter() {
 
 // --- View ---
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
 	var screen string
 	if m.view == viewCreate && m.createScreen != nil {
 		content := m.createScreen.View()
@@ -558,5 +558,7 @@ func (m Model) View() string {
 		}
 	}
 
-	return screen
+	v := tea.NewView(screen)
+	v.AltScreen = true
+	return v
 }

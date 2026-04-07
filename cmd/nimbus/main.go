@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/wagnerbm/nimbusv2/internal/trace"
 	"github.com/wagnerbm/nimbusv2/internal/ui"
 )
@@ -34,7 +34,7 @@ func main() {
 	logger.Log("nimbus starting")
 
 	model := ui.NewModel(logger)
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
