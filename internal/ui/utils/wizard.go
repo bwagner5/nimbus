@@ -1,4 +1,4 @@
-package ui
+package utils
 
 import (
 	"strings"
@@ -46,6 +46,9 @@ type Step struct {
 	filePath     string
 	skipLabel    string
 }
+
+// ResetSelected resets the selected index to 0.
+func (s *Step) ResetSelected() { s.selected = 0 }
 
 // Wizard is a multi-step form wizard
 type Wizard struct {
@@ -131,6 +134,7 @@ func (w *Wizard) Values() map[string]string {
 
 func (w *Wizard) IsCompleted() bool { return w.completed }
 func (w *Wizard) IsCancelled() bool { return w.cancelled }
+func (w *Wizard) SetCancelled()     { w.cancelled = true }
 
 func (w *Wizard) Update(msg tea.Msg) (*Wizard, tea.Cmd) {
 	step := w.Current()
@@ -140,6 +144,26 @@ func (w *Wizard) Update(msg tea.Msg) (*Wizard, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// For textarea steps, only intercept esc/ctrl+c/tab — let everything else through
+		if step.Type == StepTextArea && !w.reviewing {
+			switch {
+			case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+				w.cancelled = true
+				return w, nil
+			case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+c"))):
+				w.cancelled = true
+				return w, nil
+			case key.Matches(msg, key.NewBinding(key.WithKeys("tab"))):
+				step.Value = step.textArea.Value()
+				return w.nextStep()
+			default:
+				var cmd tea.Cmd
+				step.textArea, cmd = step.textArea.Update(msg)
+				step.Value = step.textArea.Value()
+				return w, cmd
+			}
+		}
+
 		switch {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
 			if w.reviewing {
@@ -415,6 +439,10 @@ func (w *Wizard) renderHelp() string {
 
 	if step.Type == StepSelect {
 		parts = []string{"↑↓:select", "enter:continue"}
+	}
+
+	if step.Type == StepTextArea {
+		parts = []string{"tab:continue"}
 	}
 
 	if step.Optional {

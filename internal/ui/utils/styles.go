@@ -1,4 +1,4 @@
-package ui
+package utils
 
 import (
 	"strings"
@@ -29,12 +29,12 @@ type Toast struct {
 	expireAt time.Time
 }
 
-type toastExpireMsg struct{}
+type ToastExpireMsg struct{}
 
-const toastDuration = 5 * time.Second
+const ToastDuration = 5 * time.Second
 
 func NewToast(msgs []string) Toast {
-	return Toast{messages: msgs, expireAt: time.Now().Add(toastDuration)}
+	return Toast{messages: msgs, expireAt: time.Now().Add(ToastDuration)}
 }
 
 func (t Toast) Active() bool {
@@ -50,5 +50,11 @@ func (t Toast) View(width int) string {
 }
 
 func ScheduleToastExpiry() tea.Cmd {
-	return tea.Tick(toastDuration, func(time.Time) tea.Msg { return toastExpireMsg{} })
+	return tea.Tick(ToastDuration, func(time.Time) tea.Msg { return ToastExpireMsg{} })
 }
+
+// BoolPtr returns a pointer to a bool value.
+func BoolPtr(b bool) *bool { return &b }
+
+// StrPtr returns a pointer to a string value.
+func StrPtr(s string) *string { return &s }
