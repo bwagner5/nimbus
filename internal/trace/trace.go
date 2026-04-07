@@ -3,17 +3,14 @@ package trace
 import (
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
-	"sync"
-	"time"
 )
 
-// Logger writes timestamped trace lines to a file. Safe for concurrent use.
+// Logger writes structured trace lines to a file using slog.
 // If not enabled, all methods are no-ops.
 type Logger struct {
-	mu      sync.Mutex
-	logger  *log.Logger
+	slog    *slog.Logger
 	file    *os.File
 	enabled bool
 }
@@ -27,26 +24,23 @@ func New(path string) (*Logger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open trace file: %w", err)
 	}
+	h := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
 	return &Logger{
-		logger:  log.New(f, "", 0),
+		slog:    slog.New(h),
 		file:    f,
 		enabled: true,
 	}, nil
 }
 
-// Log writes a formatted trace line with a timestamp.
+// Log writes a formatted trace line.
 func (t *Logger) Log(format string, args ...any) {
 	if !t.enabled {
 		return
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	ts := time.Now().Format("15:04:05.000")
-	t.logger.Printf("%s  %s", ts, fmt.Sprintf(format, args...))
+	t.slog.Debug(fmt.Sprintf(format, args...))
 }
 
-// Writer returns an io.Writer for bubbletea's WithOutput debug logging.
-// Returns nil if tracing is disabled.
+// Writer returns an io.Writer for debug logging. Returns nil if disabled.
 func (t *Logger) Writer() io.Writer {
 	if !t.enabled {
 		return nil
