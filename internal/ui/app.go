@@ -189,13 +189,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case instances.CreateDoneMsg:
 		m.trace.Log("msg=CreateDoneMsg view=%s screenNil=%v", m.view, m.createScreen == nil)
 		if m.view == viewCreate && m.createScreen != nil && m.createScreen.IsComplete() {
+			m.pollRegion = m.createScreen.Region()
 			m.view = viewResources
 			m.createScreen = nil
-			if !m.refreshing {
-				m.loading, m.refreshing = true, true
-				m.resources = nil
-				return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
-			}
+			m.refreshGen++
+			return m, tea.Batch(
+				instances.FetchRegionOnly(m.ctx, m.provider(), m.pollRegion),
+				instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
+			)
 		}
 
 	case instances.BundlesMsg, instances.BlueprintsMsg:
@@ -293,12 +294,17 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.createScreen, cmd = m.createScreen.Update(msg)
 		if m.createScreen.IsCancelled() || m.createScreen.IsComplete() {
+			if m.createScreen.IsComplete() {
+				m.pollRegion = m.createScreen.Region()
+			}
 			m.view = viewResources
 			m.createScreen = nil
-			if !m.refreshing {
-				m.loading, m.refreshing = true, true
-				m.resources = nil
-				return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
+			if m.pollRegion != "" {
+				m.refreshGen++
+				return m, tea.Batch(
+					instances.FetchRegionOnly(m.ctx, m.provider(), m.pollRegion),
+					instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
+				)
 			}
 			return m, nil
 		}

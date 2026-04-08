@@ -423,6 +423,11 @@ func (s *CreateScreen) ClearErrors() {
 	s.errors = nil
 }
 
+// Region returns the region this create screen targets.
+func (s *CreateScreen) Region() string {
+	return s.region
+}
+
 func (s *CreateScreen) View() string {
 	if !s.loaded {
 		return utils.TitleStyle.Render(" Loading instance options... ")
