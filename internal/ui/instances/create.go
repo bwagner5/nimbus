@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail/types"
-	tea "charm.land/bubbletea/v2"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 	"github.com/wagnerbm/nimbusv2/internal/ui/utils"
 )
@@ -87,7 +86,7 @@ func (s *CreateScreen) fetchBlueprints() tea.Cmd {
 }
 
 func (s *CreateScreen) initWizard() {
-	defaultName := fmt.Sprintf("instance-%s", time.Now().Format("0102-1504"))
+	defaultName := RandomName()
 	steps := []utils.Step{
 		{Key: "name", Title: "Instance Name", Description: "Enter a unique name for your instance", Type: utils.StepText, Required: false, DefaultValue: defaultName},
 		{Key: "platform", Title: "Platform", Description: "Select the operating system platform", Type: utils.StepSelect, Options: []utils.Option{
