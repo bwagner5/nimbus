@@ -53,6 +53,24 @@ func ScheduleToastExpiry() tea.Cmd {
 	return tea.Tick(ToastDuration, func(time.Time) tea.Msg { return ToastExpireMsg{} })
 }
 
+// RenderWithStatusBar pads content to fill height and pins a styled help bar at the bottom.
+func RenderWithStatusBar(content, help string, width, height int) string {
+	helpBar := StatusBarStyle.Width(width).Render(help)
+	lines := strings.Split(content, "\n")
+	contentHeight := height - 1
+	if contentHeight < 0 {
+		contentHeight = 0
+	}
+	for len(lines) < contentHeight {
+		lines = append(lines, "")
+	}
+	if len(lines) > contentHeight {
+		lines = lines[:contentHeight]
+	}
+	lines = append(lines, helpBar)
+	return strings.Join(lines, "\n")
+}
+
 // BoolPtr returns a pointer to a bool value.
 func BoolPtr(b bool) *bool { return &b }
 

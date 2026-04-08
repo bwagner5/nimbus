@@ -40,45 +40,28 @@ func RenderResources(provider resources.Provider, filtered []resources.Resource,
 	}
 
 	content := b.String()
-	contentLines := strings.Split(content, "\n")
 
-	// Build bottom: optional progress line + help bar
 	sLabel := "s:stop"
 	if len(filtered) > 0 && cursor < len(filtered) && filtered[cursor].Status() == "stopped" {
 		sLabel = "s:start"
 	}
-	help := fmt.Sprintf(" q:quit  /:filter  ::resources  r:regions  c:create  %s  d:delete  x:shell  R:refresh  j/k:navigate ", sLabel)
-	helpBar := utils.StatusBarStyle.Width(width).Render(help)
+	help := fmt.Sprintf(" q:quit  /:filter  ::resources  r:regions  enter:details  c:create  %s  d:delete  x:shell  R:refresh  j/k:navigate ", sLabel)
 
-	progressBar := ""
 	if progress != "" {
-		progressBar = utils.HelpStyle.Width(width).Render(" " + spinnerView + " " + progress)
+		progressLine := utils.HelpStyle.Width(width).Render(" " + spinnerView + " " + progress)
+		// Reserve 2 lines at bottom: progress + help
+		lines := strings.Split(content, "\n")
+		ph := height - 2
+		for len(lines) < ph {
+			lines = append(lines, "")
+		}
+		if len(lines) > ph {
+			lines = lines[:ph]
+		}
+		content = strings.Join(lines, "\n") + "\n" + progressLine
 	}
 
-	// Calculate how many lines the content area gets
-	bottomLines := 1 // help bar
-	if progressBar != "" {
-		bottomLines = 2
-	}
-	contentHeight := height - bottomLines
-	if contentHeight < 0 {
-		contentHeight = 0
-	}
-
-	// Pad or truncate content to fill available space
-	for len(contentLines) < contentHeight {
-		contentLines = append(contentLines, "")
-	}
-	if len(contentLines) > contentHeight {
-		contentLines = contentLines[:contentHeight]
-	}
-
-	if progressBar != "" {
-		contentLines = append(contentLines, progressBar)
-	}
-	contentLines = append(contentLines, helpBar)
-
-	return strings.Join(contentLines, "\n")
+	return utils.RenderWithStatusBar(content, help, width, height)
 }
 
 // RenderRegionModal renders the region selection modal content.

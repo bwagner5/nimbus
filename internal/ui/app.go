@@ -10,6 +10,7 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/aws/aws-sdk-go-v2/service/lightsail/types"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 	"github.com/wagnerbm/nimbusv2/internal/resources"
 	"github.com/wagnerbm/nimbusv2/internal/trace"
@@ -26,6 +27,7 @@ const (
 	viewFilter
 	viewCreate
 	viewConfirm
+	viewDetail
 )
 
 // Model is the top-level application model.
@@ -58,6 +60,7 @@ type Model struct {
 	lastRefreshDone time.Time
 	spinner         spinner.Model
 	trace           *trace.Logger
+	detail          *types.Instance
 }
 
 func (v view) String() string {
@@ -74,6 +77,8 @@ func (v view) String() string {
 		return "create"
 	case viewConfirm:
 		return "confirm"
+	case viewDetail:
+		return "detail"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(v))
 	}
@@ -216,6 +221,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.createScreen, _ = m.createScreen.Update(msg)
 		}
 
+	// Detail
+	case instances.InstanceDetailMsg:
+		m.trace.Log("msg=InstanceDetail err=%v", msg.Err)
+		if msg.Err != nil {
+			m.toast = utils.NewToast([]string{msg.Err.Error()})
+			m.view = viewResources
+			return m, utils.ScheduleToastExpiry()
+		}
+		m.detail = msg.Instance
+
 	// Actions
 	case instances.ActionResultMsg:
 		m.trace.Log("msg=ActionResult err=%v msg=%q region=%q", msg.Err, msg.Msg, msg.Region)
@@ -341,6 +356,48 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleFilterKey(msg)
 	}
 
+	// Detail view keys
+	if m.view == viewDetail && m.detail != nil {
+		name := ""
+		region := ""
+		if m.detail.Name != nil {
+			name = *m.detail.Name
+		}
+		if m.detail.Location != nil && m.detail.Location.AvailabilityZone != nil {
+			region = string(m.detail.Location.RegionName)
+		}
+		state := ""
+		if m.detail.State != nil && m.detail.State.Name != nil {
+			state = *m.detail.State.Name
+		}
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+			m.view = viewResources
+			m.detail = nil
+			return m, nil
+		case key.Matches(msg, key.NewBinding(key.WithKeys("s"))):
+			kind := instances.ActionStop
+			if state == "stopped" {
+				kind = instances.ActionStart
+			}
+			m.confirm = &instances.ConfirmAction{Kind: kind, Name: name, Region: region}
+			m.view = viewConfirm
+			return m, nil
+		case key.Matches(msg, key.NewBinding(key.WithKeys("d"))):
+			m.confirm = &instances.ConfirmAction{Kind: instances.ActionDelete, Name: name, Region: region}
+			m.view = viewConfirm
+			return m, nil
+		case key.Matches(msg, key.NewBinding(key.WithKeys("x"))):
+			if state == "running" {
+				return m, instances.FetchSSHCredentials(m.ctx, m.client, name, region)
+			}
+		case key.Matches(msg, key.NewBinding(key.WithKeys("q", "ctrl+c"))):
+			m.cancel()
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+
 	// Global + resource-view keys
 	switch {
 	case key.Matches(msg, key.NewBinding(key.WithKeys("q", "ctrl+c"))):
@@ -424,6 +481,12 @@ func (m Model) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
+	if m.view == viewResources && m.provider().Kind() == "lightsail/instances" && len(m.filtered) > 0 {
+		r := m.filtered[m.cursor]
+		m.view = viewDetail
+		m.detail = nil
+		return m, instances.FetchInstanceDetail(m.ctx, m.client, r.Name(), r.Region())
+	}
 	if m.view == viewRegions {
 		m.cancel()
 		m.ctx, m.cancel = context.WithCancel(context.Background())
@@ -546,6 +609,8 @@ func (m Model) View() tea.View {
 		m.trace.Log("View: create screen len(content)=%d width=%d height=%d", len(content), m.width, m.height)
 		base := instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
 		screen = utils.Overlay(base, content, m.width, m.height)
+	} else if m.view == viewDetail {
+		screen = instances.RenderInstanceDetail(m.detail, m.width, m.height)
 	} else {
 		base := instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
 		switch m.view {
