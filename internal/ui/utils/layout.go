@@ -31,13 +31,14 @@ func Overlay(base, modal string, width, height int) string {
 	}
 
 	result := make([]string, height)
+	dim := lipgloss.NewStyle().Faint(true)
 	for y := 0; y < height; y++ {
 		if y >= startY && y < startY+modalH {
 			mIdx := y - startY
 			pad := strings.Repeat(" ", startX)
 			result[y] = pad + modalLines[mIdx]
 		} else {
-			result[y] = baseLines[y]
+			result[y] = dim.Render(baseLines[y])
 		}
 	}
 	return strings.Join(result, "\n")

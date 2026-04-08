@@ -526,11 +526,8 @@ func (m Model) View() tea.View {
 	if m.view == viewCreate && m.createScreen != nil {
 		content := m.createScreen.View()
 		m.trace.Log("View: create screen len(content)=%d width=%d height=%d", len(content), m.width, m.height)
-		modal := utils.ModalStyle.Width(70).Render(content)
-		m.trace.Log("View: modal len=%d lines=%d", len(modal), strings.Count(modal, "\n")+1)
 		base := instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
 		screen = utils.Overlay(base, content, m.width, m.height)
-		screen = utils.CenterModal(modal, m.width, m.height)
 	} else {
 		base := instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
 		switch m.view {
