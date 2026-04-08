@@ -33,13 +33,9 @@ func FetchInstanceDetail(ctx context.Context, client *aws.Client, name, region s
 }
 
 // RenderInstanceDetail renders a pretty detail view for an instance.
-func RenderInstanceDetail(inst *types.Instance, width, height int) string {
+func RenderInstanceDetail(inst *types.Instance, metrics *MetricsData, metricsLoading bool, rangeIdx int, width int) string {
 	if inst == nil {
-		return utils.RenderWithStatusBar(
-			utils.TitleStyle.Render(" Loading instance details... "),
-			" esc:back ",
-			width, height,
-		)
+		return utils.TitleStyle.Render(" Loading instance details... ")
 	}
 
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
@@ -174,8 +170,21 @@ func RenderInstanceDetail(inst *types.Instance, width, height int) string {
 		b.WriteString("\n")
 	}
 
-	help := " esc:back  s:stop/start  d:delete  x:shell "
-	return utils.RenderWithStatusBar(b.String(), help, width, height)
+	// Metrics
+	b.WriteString(RenderMetrics(metrics, metricsLoading, width))
+
+	// Range selector
+	rangeStr := "  Range: "
+	for i, mr := range MetricRanges {
+		if i == rangeIdx {
+			rangeStr += lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Render("["+mr.Label+"]") + " "
+		} else {
+			rangeStr += dim.Render(mr.Label) + " "
+		}
+	}
+	b.WriteString(rangeStr + dim.Render("  [/]:change range") + "\n")
+
+	return b.String()
 }
 
 func deref(s *string) string {

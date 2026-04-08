@@ -8,6 +8,7 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail/types"
@@ -61,6 +62,12 @@ type Model struct {
 	spinner         spinner.Model
 	trace           *trace.Logger
 	detail          *types.Instance
+	metrics         *instances.MetricsData
+	metricsLoading  bool
+	metricRange     int // index into MetricRanges
+	detailName      string
+	detailRegion    string
+	detailVP        viewport.Model
 }
 
 func (v view) String() string {
@@ -131,6 +138,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		if m.createScreen != nil {
 			m.createScreen.SetSize(m.width, m.height)
+		}
+		if m.view == viewDetail {
+			m.detailVP.SetWidth(m.width)
+			m.detailVP.SetHeight(m.height - 1)
+			m.updateDetailContent()
 		}
 
 	case spinner.TickMsg:
@@ -230,6 +242,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, utils.ScheduleToastExpiry()
 		}
 		m.detail = msg.Instance
+		m.updateDetailContent()
+
+	case instances.MetricsMsg:
+		m.trace.Log("msg=MetricsMsg err=%v", msg.Err)
+		if msg.Err == nil {
+			m.metrics = msg.Data
+			m.metricsLoading = false
+			m.updateDetailContent()
+		}
 
 	// Actions
 	case instances.ActionResultMsg:
@@ -306,6 +327,15 @@ func (m Model) handleRefreshTick(msg instances.RefreshTickMsg) (tea.Model, tea.C
 		m.refreshGen++
 		return m, instances.ScheduleRefresh(m.refreshGen, m.pollRegion)
 	}
+	if m.view == viewDetail && m.detailName != "" {
+		// Refresh metrics periodically while viewing detail
+		m.refreshGen++
+		mr := instances.MetricRanges[m.metricRange]
+		return m, tea.Batch(
+			instances.FetchMetrics(m.ctx, m.client, m.detailName, m.detailRegion, mr),
+			instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
+		)
+	}
 	m.refreshing = true
 	if m.pollRegion != "" {
 		return m, instances.FetchRegionOnly(m.ctx, m.provider(), m.pollRegion)
@@ -357,25 +387,51 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Detail view keys
-	if m.view == viewDetail && m.detail != nil {
-		name := ""
-		region := ""
-		if m.detail.Name != nil {
-			name = *m.detail.Name
-		}
-		if m.detail.Location != nil && m.detail.Location.AvailabilityZone != nil {
-			region = string(m.detail.Location.RegionName)
-		}
+	if m.view == viewDetail {
+		name := m.detailName
+		region := m.detailRegion
 		state := ""
-		if m.detail.State != nil && m.detail.State.Name != nil {
+		if m.detail != nil && m.detail.State != nil && m.detail.State.Name != nil {
 			state = *m.detail.State.Name
 		}
 		switch {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
 			m.view = viewResources
 			m.detail = nil
+			m.metrics = nil
 			return m, nil
+		case key.Matches(msg, key.NewBinding(key.WithKeys("["))):
+			if m.metricRange > 0 {
+				m.metricRange--
+				m.metricsLoading = true
+				m.updateDetailContent()
+				mr := instances.MetricRanges[m.metricRange]
+				return m, instances.FetchMetrics(m.ctx, m.client, name, region, mr)
+			}
+			m.toast = utils.NewToast([]string{"Already at shortest range"})
+			return m, utils.ScheduleToastExpiry()
+		case key.Matches(msg, key.NewBinding(key.WithKeys("]"))):
+			if m.metricRange < len(instances.MetricRanges)-1 {
+				m.metricRange++
+				m.metricsLoading = true
+				m.updateDetailContent()
+				mr := instances.MetricRanges[m.metricRange]
+				return m, instances.FetchMetrics(m.ctx, m.client, name, region, mr)
+			}
+			m.toast = utils.NewToast([]string{"Already at longest range"})
+			return m, utils.ScheduleToastExpiry()
+		case key.Matches(msg, key.NewBinding(key.WithKeys("j", "down"))):
+			var cmd tea.Cmd
+			m.detailVP, cmd = m.detailVP.Update(msg)
+			return m, cmd
+		case key.Matches(msg, key.NewBinding(key.WithKeys("k", "up"))):
+			var cmd tea.Cmd
+			m.detailVP, cmd = m.detailVP.Update(msg)
+			return m, cmd
 		case key.Matches(msg, key.NewBinding(key.WithKeys("s"))):
+			if m.detail == nil {
+				return m, nil
+			}
 			kind := instances.ActionStop
 			if state == "stopped" {
 				kind = instances.ActionStart
@@ -384,6 +440,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.view = viewConfirm
 			return m, nil
 		case key.Matches(msg, key.NewBinding(key.WithKeys("d"))):
+			if m.detail == nil {
+				return m, nil
+			}
 			m.confirm = &instances.ConfirmAction{Kind: instances.ActionDelete, Name: name, Region: region}
 			m.view = viewConfirm
 			return m, nil
@@ -394,8 +453,15 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("q", "ctrl+c"))):
 			m.cancel()
 			return m, tea.Quit
+		default:
+			// Forward to viewport for scrolling (j/k/up/down/pgup/pgdn)
+			m.trace.Log("detail: forwarding key=%q to viewport, yOffset=%d totalLines=%d height=%d",
+				msg.String(), m.detailVP.YOffset(), m.detailVP.TotalLineCount(), m.detailVP.Height())
+			var cmd tea.Cmd
+			m.detailVP, cmd = m.detailVP.Update(msg)
+			m.trace.Log("detail: after viewport update yOffset=%d", m.detailVP.YOffset())
+			return m, cmd
 		}
-		return m, nil
 	}
 
 	// Global + resource-view keys
@@ -485,7 +551,17 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 		r := m.filtered[m.cursor]
 		m.view = viewDetail
 		m.detail = nil
-		return m, instances.FetchInstanceDetail(m.ctx, m.client, r.Name(), r.Region())
+		m.metrics = nil
+		m.detailName = r.Name()
+		m.detailRegion = r.Region()
+		m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))
+		// Disable viewport keys that conflict with our bindings
+		m.detailVP.KeyMap.HalfPageDown.SetEnabled(false) // 'd' conflicts with delete
+		mr := instances.MetricRanges[m.metricRange]
+		return m, tea.Batch(
+			instances.FetchInstanceDetail(m.ctx, m.client, r.Name(), r.Region()),
+			instances.FetchMetrics(m.ctx, m.client, r.Name(), r.Region(), mr),
+		)
 	}
 	if m.view == viewRegions {
 		m.cancel()
@@ -593,6 +669,13 @@ func (m Model) handleShellKey() (tea.Model, tea.Cmd) {
 
 // --- Helpers ---
 
+func (m *Model) updateDetailContent() {
+	content := instances.RenderInstanceDetail(m.detail, m.metrics, m.metricsLoading, m.metricRange, m.width)
+	m.detailVP.SetContent(content)
+	m.trace.Log("updateDetailContent: contentLines=%d vpHeight=%d vpWidth=%d totalLines=%d",
+		strings.Count(content, "\n")+1, m.detailVP.Height(), m.detailVP.Width(), m.detailVP.TotalLineCount())
+}
+
 func (m *Model) applyFilter() {
 	m.filtered = instances.ApplyFilter(m.resources, m.filter)
 	if m.cursor >= len(m.filtered) {
@@ -610,7 +693,8 @@ func (m Model) View() tea.View {
 		base := instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
 		screen = utils.Overlay(base, content, m.width, m.height)
 	} else if m.view == viewDetail {
-		screen = instances.RenderInstanceDetail(m.detail, m.width, m.height)
+		help := " esc:back  s:stop/start  d:delete  x:shell  [/]:range  ↑↓:scroll  pgup/pgdn "
+		screen = utils.RenderWithStatusBar(m.detailVP.View(), help, m.width, m.height)
 	} else {
 		base := instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
 		switch m.view {
