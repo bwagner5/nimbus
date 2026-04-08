@@ -95,9 +95,10 @@ func NewModel(logger *trace.Logger) Model {
 			resources.NewLightsailContainerProvider(client),
 			resources.NewLightsailDistributionProvider(client),
 		},
-		region:  "global",
-		loading: true,
-		ctx:     ctx,
+		region:     "global",
+		loading:    true,
+		refreshing: true,
+		ctx:        ctx,
 		cancel:  cancel,
 		spinner: s,
 		trace:   logger,
@@ -190,9 +191,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view == viewCreate && m.createScreen != nil && m.createScreen.IsComplete() {
 			m.view = viewResources
 			m.createScreen = nil
-			m.loading = true
-			m.resources = nil
-			return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
+			if !m.refreshing {
+				m.loading, m.refreshing = true, true
+				m.resources = nil
+				return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
+			}
 		}
 
 	case instances.BundlesMsg, instances.BlueprintsMsg:
@@ -292,9 +295,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.createScreen.IsCancelled() || m.createScreen.IsComplete() {
 			m.view = viewResources
 			m.createScreen = nil
-			m.loading = true
-			m.resources = nil
-			return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
+			if !m.refreshing {
+				m.loading, m.refreshing = true, true
+				m.resources = nil
+				return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
+			}
+			return m, nil
 		}
 		return m, cmd
 	}
