@@ -3,9 +3,12 @@ package instances
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"sort"
 	"strings"
 
+	"charm.land/bubbles/v2/filepicker"
 	tea "charm.land/bubbletea/v2"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail/types"
@@ -23,6 +26,9 @@ type CreateResult struct {
 // CreateDoneMsg signals auto-return after successful creation.
 type CreateDoneMsg struct{}
 
+// EditorResultMsg is returned when the external editor exits.
+type EditorResultMsg struct{ Err error }
+
 // CreateScreen handles Lightsail instance creation.
 type CreateScreen struct {
 	wizard        *utils.Wizard
@@ -37,6 +43,8 @@ type CreateScreen struct {
 	errors        []string
 	gotBundles    bool
 	gotBlueprints bool
+	filePicker    *filepicker.Model
+	editorTmp     string // temp file path for editor
 }
 
 // BundlesMsg carries fetched bundle data.
@@ -103,8 +111,15 @@ func (s *CreateScreen) initWizard() {
 			{Value: "ipv6", Label: "IPv6 only", Description: "IPv6 address only"},
 		}},
 		{Key: "bundle", Title: "Instance Size", Description: "Select compute and memory configuration", Type: utils.StepSelect, Options: s.bundleOptions("linux", "dualstack")},
-		{Key: "script", Title: "Launch Script", Description: "Optional startup script to run on first boot", Type: utils.StepTextArea, Optional: true},
-		{Key: "ssh_key", Title: "SSH Key Path", Description: "Optional path to public SSH key file", Type: utils.StepFilePicker, Optional: true},
+		{Key: "script", Title: "Launch Script", Description: "Optional startup script to run on first boot", Type: utils.StepScriptSource, Optional: true, Options: []utils.Option{
+			{Value: "skip", Label: "Skip", Description: "No launch script"},
+			{Value: "file", Label: "Pick a file", Description: "Select an existing script from disk"},
+			{Value: "editor", Label: "Write in editor", Description: "Open $EDITOR to write a script"},
+		}},
+		{Key: "ssh_key", Title: "SSH Key", Description: "Add a public SSH key to the instance", Type: utils.StepScriptSource, Optional: true, Options: []utils.Option{
+			{Value: "skip", Label: "Skip", Description: "Can still SSH with dynamic keys"},
+			{Value: "file", Label: "Pick a file", Description: "Select a public key from disk"},
+		}},
 		{Key: "snapshots", Title: "Automatic Snapshots", Description: "Enable daily automatic backups", Type: utils.StepSelect, Options: []utils.Option{
 			{Value: "enabled", Label: "Enabled", Description: "Daily snapshots", Price: "+$0.05/GB/mo"},
 			{Value: "disabled", Label: "Disabled", Description: "No automatic backups"},
@@ -300,6 +315,11 @@ func (s *CreateScreen) blueprintOptions(platform, imageType string) []utils.Opti
 }
 
 func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
+	// Handle file picker sub-state
+	if s.filePicker != nil {
+		return s.updateFilePicker(msg)
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
 		if s.result != nil && !s.result.Success {
@@ -308,6 +328,17 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 				return s, nil
 			}
 		}
+	case EditorResultMsg:
+		if msg.Err == nil && s.editorTmp != "" {
+			data, err := os.ReadFile(s.editorTmp)
+			if err == nil && len(data) > 0 {
+				s.wizard.SetCurrentValue(string(data))
+			}
+			os.Remove(s.editorTmp)
+		}
+		s.editorTmp = ""
+		s.wizard.AdvanceStep()
+		return s, nil
 	case BundlesMsg:
 		s.gotBundles = true
 		if msg.Err != nil {
@@ -355,11 +386,83 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 		s.updateBundleOptions()
 	}
 
+	// Check if user just selected a script/file source option
+	if step := s.wizard.Current(); step != nil && step.Type == utils.StepScriptSource && step.Value != "" {
+		switch step.Value {
+		case "skip":
+			step.Value = ""
+			s.wizard.AdvanceStep()
+			return s, nil
+		case "file":
+			step.Value = ""
+			return s, s.openFilePicker()
+		case "editor":
+			step.Value = ""
+			return s, s.openEditor()
+		}
+	}
+
+	// Auto-open file picker for StepFilePicker steps
+	if step := s.wizard.Current(); step != nil && step.Type == utils.StepFilePicker && s.filePicker == nil && s.wizard.CurrentIndex() != prevStep {
+		return s, s.openFilePicker()
+	}
+
 	if s.wizard.IsCompleted() {
 		return s, s.createInstance()
 	}
 
 	return s, cmd
+}
+
+func (s *CreateScreen) updateFilePicker(msg tea.Msg) (*CreateScreen, tea.Cmd) {
+	if kmsg, ok := msg.(tea.KeyPressMsg); ok && kmsg.String() == "esc" {
+		s.filePicker = nil
+		return s, nil
+	}
+	fp, cmd := s.filePicker.Update(msg)
+	s.filePicker = &fp
+	if didSelect, path := s.filePicker.DidSelectFile(msg); didSelect {
+		step := s.wizard.Current()
+		if step != nil && step.Key == "script" {
+			data, err := os.ReadFile(path)
+			if err == nil {
+				s.wizard.SetCurrentValue(string(data))
+			}
+		} else {
+			s.wizard.SetCurrentValue(path)
+		}
+		s.filePicker = nil
+		s.wizard.AdvanceStep()
+		return s, nil
+	}
+	return s, cmd
+}
+
+func (s *CreateScreen) openFilePicker() tea.Cmd {
+	fp := filepicker.New()
+	fp.CurrentDirectory, _ = os.Getwd()
+	fp.AutoHeight = false
+	fp.SetHeight(15)
+	s.filePicker = &fp
+	return s.filePicker.Init()
+}
+
+func (s *CreateScreen) openEditor() tea.Cmd {
+	tmpFile, err := os.CreateTemp("", "nimbus-script-*.sh")
+	if err != nil {
+		return nil
+	}
+	tmpFile.Close()
+	s.editorTmp = tmpFile.Name()
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+	c := exec.Command(editor, s.editorTmp)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return EditorResultMsg{Err: err}
+	})
 }
 
 func (s *CreateScreen) createInstance() tea.Cmd {
@@ -440,6 +543,12 @@ func (s *CreateScreen) View() string {
 			return utils.RunningStyle.Render("✓ " + s.result.Message)
 		}
 		return utils.ErrorStyle.Render("✗ Error: "+s.result.Err.Error()) + "\n\n" + utils.HelpStyle.Render("  Press esc to go back")
+	}
+	if s.filePicker != nil {
+		return utils.TitleStyle.Render("  Select Script File") + "\n\n" + s.filePicker.View() + "\n\n" + utils.HelpStyle.Render("  enter:select  esc:cancel")
+	}
+	if s.editorTmp != "" {
+		return utils.TitleStyle.Render(" Opening editor... ")
 	}
 	return s.wizard.View()
 }

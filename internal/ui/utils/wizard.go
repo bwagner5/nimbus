@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"fmt"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -19,6 +20,7 @@ const (
 	StepTextArea
 	StepFilePicker
 	StepReview
+	StepScriptSource // choose between file picker or editor
 )
 
 // Option for select steps
@@ -136,6 +138,18 @@ func (w *Wizard) IsCompleted() bool { return w.completed }
 func (w *Wizard) IsCancelled() bool { return w.cancelled }
 func (w *Wizard) SetCancelled()     { w.cancelled = true }
 
+// SetCurrentValue sets the value of the current step.
+func (w *Wizard) SetCurrentValue(v string) {
+	if step := w.Current(); step != nil {
+		step.Value = v
+	}
+}
+
+// AdvanceStep moves to the next step.
+func (w *Wizard) AdvanceStep() {
+	w.nextStep()
+}
+
 func (w *Wizard) Update(msg tea.Msg) (*Wizard, tea.Cmd) {
 	step := w.Current()
 	if step == nil {
@@ -188,12 +202,12 @@ func (w *Wizard) Update(msg tea.Msg) (*Wizard, tea.Cmd) {
 			}
 
 		case key.Matches(msg, key.NewBinding(key.WithKeys("up", "k"))):
-			if step.Type == StepSelect && step.selected > 0 {
+			if (step.Type == StepSelect || step.Type == StepScriptSource) && step.selected > 0 {
 				step.selected--
 			}
 
 		case key.Matches(msg, key.NewBinding(key.WithKeys("down", "j"))):
-			if step.Type == StepSelect && step.selected < len(step.Options)-1 {
+			if (step.Type == StepSelect || step.Type == StepScriptSource) && step.selected < len(step.Options)-1 {
 				step.selected++
 			}
 
@@ -245,9 +259,13 @@ func (w *Wizard) handleEnter() (*Wizard, tea.Cmd) {
 	}
 
 	switch step.Type {
-	case StepSelect:
+	case StepSelect, StepScriptSource:
 		if len(step.Options) > 0 {
 			step.Value = step.Options[step.selected].Value
+		}
+		if step.Type == StepScriptSource {
+			// Don't advance — the create screen handles the transition
+			return w, nil
 		}
 		return w.nextStep()
 
@@ -345,7 +363,7 @@ func (w *Wizard) renderStep(step *Step) string {
 	b.WriteString("\n")
 
 	switch step.Type {
-	case StepSelect:
+	case StepSelect, StepScriptSource:
 		b.WriteString(w.renderSelectOptions(step))
 	case StepText, StepFilePicker:
 		b.WriteString("  " + step.textInput.View())
@@ -416,6 +434,11 @@ func (w *Wizard) renderReview() string {
 				}
 			}
 		}
+		// Show script content as line count summary
+		if step.Type == StepScriptSource && val != "" && val != "(not set)" {
+			lines := strings.Count(val, "\n") + 1
+			val = fmt.Sprintf("(%d lines)", lines)
+		}
 		if len(val) > 40 {
 			val = val[:37] + "..."
 		}
@@ -437,7 +460,7 @@ func (w *Wizard) renderHelp() string {
 	var parts []string
 	parts = append(parts, "enter:continue")
 
-	if step.Type == StepSelect {
+	if step.Type == StepSelect || step.Type == StepScriptSource {
 		parts = []string{"↑↓:select", "enter:continue"}
 	}
 
@@ -445,10 +468,10 @@ func (w *Wizard) renderHelp() string {
 		parts = []string{"tab:continue"}
 	}
 
-	if step.Optional {
+	if step.Optional && step.Type != StepScriptSource {
 		parts = append(parts, "tab:skip")
 	}
-	if w.current > 0 && step.Type == StepSelect {
+	if w.current > 0 && (step.Type == StepSelect || step.Type == StepScriptSource) {
 		parts = append(parts, "backspace:back")
 	}
 	parts = append(parts, "esc:cancel")

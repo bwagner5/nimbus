@@ -210,6 +210,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case instances.EditorResultMsg:
+		m.trace.Log("msg=EditorResult err=%v", msg.Err)
+		if m.createScreen != nil {
+			m.createScreen, _ = m.createScreen.Update(msg)
+		}
+
 	// Actions
 	case instances.ActionResultMsg:
 		m.trace.Log("msg=ActionResult err=%v msg=%q region=%q", msg.Err, msg.Msg, msg.Region)
@@ -256,6 +262,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.toast = utils.NewToast([]string{msg.Error()})
 		m.loading, m.progress, m.refreshing = false, "", false
 		return m, utils.ScheduleToastExpiry()
+	}
+	// Forward unhandled messages to create screen (e.g. filepicker internal msgs)
+	if m.view == viewCreate && m.createScreen != nil {
+		var cmd tea.Cmd
+		m.createScreen, cmd = m.createScreen.Update(msg)
+		return m, cmd
 	}
 	return m, nil
 }
