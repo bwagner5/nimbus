@@ -5,11 +5,12 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/wagnerbm/nimbusv2/internal/applications"
 	"github.com/wagnerbm/nimbusv2/internal/ui/utils"
 )
 
 // RenderAppDetail renders the application detail view.
-func RenderAppDetail(detail *AppDetail, width int) string {
+func RenderAppDetail(detail *applications.Detail, width int) string {
 	if detail == nil {
 		return utils.TitleStyle.Render(" Loading application details... ")
 	}
@@ -23,14 +24,12 @@ func RenderAppDetail(detail *AppDetail, width int) string {
 
 	var b strings.Builder
 
-	// Header
 	stateStyled := green.Render("● " + detail.State)
 	b.WriteString(title.Render("  "+detail.Name) + "  " + stateStyled + "\n")
 	b.WriteString(dim.Render("  bucket: "+detail.Bucket) + "\n\n")
 
 	row := func(l, v string) { b.WriteString("  " + label.Render(l) + val.Render(v) + "\n") }
 
-	// General
 	b.WriteString(section.Render("  ─── General ") + "\n")
 	row("Region:", detail.Region)
 	row("Bucket:", detail.Bucket)
@@ -42,7 +41,6 @@ func RenderAppDetail(detail *AppDetail, width int) string {
 	row("Targets:", fmt.Sprintf("%d", totalTargets))
 	b.WriteString("\n")
 
-	// Environments
 	if len(detail.Environments) > 0 {
 		for _, env := range detail.Environments {
 			b.WriteString(section.Render(fmt.Sprintf("  ─── Environment: %s ", env.Name)) + "\n")

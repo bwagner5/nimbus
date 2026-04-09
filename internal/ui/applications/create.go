@@ -5,38 +5,30 @@ import (
 	"fmt"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/aws/aws-sdk-go-v2/service/lightsail"
-	lstypes "github.com/aws/aws-sdk-go-v2/service/lightsail/types"
+	"github.com/wagnerbm/nimbusv2/internal/applications"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
-	"github.com/wagnerbm/nimbusv2/internal/resources"
 	"github.com/wagnerbm/nimbusv2/internal/ui/utils"
 )
 
 // CreateScreen handles application creation.
 type CreateScreen struct {
-	wizard      *utils.Wizard
-	client      *aws.Client
-	region      string
-	ctx         context.Context
-	accountID   string
-	creating    bool
-	result      *CreateAppMsg
-	loaded      bool
-	instances   []instanceOption
-	gotAccount  bool
+	wizard       *utils.Wizard
+	client       *aws.Client
+	region       string
+	ctx          context.Context
+	accountID    string
+	creating     bool
+	result       *CreateAppMsg
+	loaded       bool
+	instances    []applications.Target
+	gotAccount   bool
 	gotInstances bool
-	errors      []string
-}
-
-type instanceOption struct {
-	Name   string
-	Region string
-	State  string
+	errors       []string
 }
 
 // InstancesMsg carries available instances for target selection.
 type InstancesMsg struct {
-	Instances []instanceOption
+	Instances []applications.Target
 	Err       error
 }
 
@@ -56,41 +48,19 @@ func (s *CreateScreen) fetchInstances() tea.Cmd {
 	region := s.region
 	ctx := s.ctx
 	return func() tea.Msg {
-		svc := lightsail.NewFromConfig(client.WithRegion(region).Config())
-		var opts []instanceOption
-		var pageToken *string
-		for {
-			out, err := svc.GetInstances(ctx, &lightsail.GetInstancesInput{PageToken: pageToken})
-			if err != nil {
-				return InstancesMsg{Err: err}
-			}
-			for _, inst := range out.Instances {
-				state := ""
-				if inst.State != nil && inst.State.Name != nil {
-					state = *inst.State.Name
-				}
-				opts = append(opts, instanceOption{
-					Name:   *inst.Name,
-					Region: region,
-					State:  state,
-				})
-			}
-			if out.NextPageToken == nil {
-				break
-			}
-			pageToken = out.NextPageToken
+		targets, err := applications.NewClient(client).ListInstances(ctx, region)
+		if err != nil {
+			return InstancesMsg{Err: err}
 		}
-		return InstancesMsg{Instances: opts}
+		return InstancesMsg{Instances: targets}
 	}
 }
 
 func (s *CreateScreen) initWizard() {
-	// Build instance options for target selection
 	var targetOpts []utils.Option
 	targetOpts = append(targetOpts, utils.Option{Value: "skip", Label: "Skip", Description: "No deployment target yet"})
 	for _, inst := range s.instances {
-		desc := inst.State
-		targetOpts = append(targetOpts, utils.Option{Value: inst.Name, Label: inst.Name, Description: desc})
+		targetOpts = append(targetOpts, utils.Option{Value: inst.Name, Label: inst.Name, Description: inst.State})
 	}
 
 	steps := []utils.Step{
@@ -168,27 +138,13 @@ func (s *CreateScreen) createApp() tea.Cmd {
 	ctx := s.ctx
 
 	return func() tea.Msg {
-		// Create the bucket
-		bucketName := fmt.Sprintf("%s%s-%s", resources.AppBucketPrefix, accountID, appName)
-		svc := lightsail.NewFromConfig(client.WithRegion(region).Config())
-		_, err := svc.CreateBucket(ctx, &lightsail.CreateBucketInput{
-			BucketName: &bucketName,
-			BundleId:   strPtr("small_1_0"),
-		})
-		if err != nil {
+		appClient := applications.NewClient(client)
+		if err := appClient.Create(ctx, accountID, appName, region); err != nil {
 			return CreateAppMsg{Err: err, Name: appName}
 		}
-
-		// Tag instance as target if selected
 		if target != "" && target != "skip" {
-			tagKey := fmt.Sprintf("nimbus:app:%s:%s", appName, envName)
-			tagVal := "true"
-			svc.TagResource(ctx, &lightsail.TagResourceInput{
-				ResourceName: &target,
-				Tags:         []lstypes.Tag{{Key: &tagKey, Value: &tagVal}},
-			})
+			appClient.AddTarget(ctx, target, appName, envName, region)
 		}
-
 		return CreateAppMsg{Name: appName}
 	}
 }

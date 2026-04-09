@@ -12,12 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/lightsail"
-	lstypes "github.com/aws/aws-sdk-go-v2/service/lightsail/types"
+	"github.com/wagnerbm/nimbusv2/internal/applications"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 )
-
-const tagPrefix = "nimbus:app:"
 
 // Deploy tars the current directory, SCPs it to the target instance, and runs docker compose up --build.
 func Deploy(ctx context.Context, client *aws.Client, appName, envName, region string) error {
@@ -26,14 +23,15 @@ func Deploy(ctx context.Context, client *aws.Client, appName, envName, region st
 		return fmt.Errorf("no docker-compose.yml or compose.yaml found in current directory")
 	}
 
+	appClient := applications.NewClient(client)
+
 	fmt.Println("🔍 Finding target instance...")
-	inst, err := findTargetInstance(ctx, client, appName, envName, region)
+	target, err := appClient.FindTarget(ctx, appName, envName, region)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("🎯 Target: %s (%s)\n", inst.Name, inst.IP)
+	fmt.Printf("🎯 Target: %s (%s)\n", target.Name, target.IP)
 
-	// Create tar.gz of current directory
 	commitID := getGitCommit()
 	assetName := fmt.Sprintf("%d-%s.tar.gz", time.Now().Unix(), commitID)
 	tmpFile, err := os.CreateTemp("", "nimbus-deploy-*.tar.gz")
@@ -51,19 +49,19 @@ func Deploy(ctx context.Context, client *aws.Client, appName, envName, region st
 	tmpFile.Close()
 
 	fmt.Println("🔑 Getting SSH credentials...")
-	creds, err := getSSHCredentials(ctx, client, inst.Name, region)
+	creds, err := appClient.GetSSHCredentials(ctx, target.Name, region)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(creds.keyPath)
-	defer os.Remove(creds.keyPath + "-cert.pub")
+	defer os.Remove(creds.KeyPath)
+	defer os.Remove(creds.KeyPath + "-cert.pub")
 
 	remotePath := "/tmp/" + assetName
 	deployDir := fmt.Sprintf("/opt/nimbus/%s/%s", appName, envName)
-	sshTarget := fmt.Sprintf("%s@%s", creds.username, inst.IP)
-	sshOpts := []string{"-i", creds.keyPath, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
+	sshTarget := fmt.Sprintf("%s@%s", creds.Username, target.IP)
+	sshOpts := []string{"-i", creds.KeyPath, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
 
-	fmt.Printf("📤 Uploading to %s...\n", inst.Name)
+	fmt.Printf("📤 Uploading to %s...\n", target.Name)
 	scpArgs := append(sshOpts, tmpPath, sshTarget+":"+remotePath)
 	if err := runCmd("scp", scpArgs...); err != nil {
 		return fmt.Errorf("scp: %w", err)
@@ -93,7 +91,6 @@ func tarDir(srcDir string, w io.Writer) error {
 		if err != nil {
 			return err
 		}
-		// Skip .git and other common non-deploy dirs
 		base := filepath.Base(path)
 		if info.IsDir() && (base == ".git" || base == "node_modules" || base == ".nimbus") {
 			return filepath.SkipDir
@@ -121,74 +118,6 @@ func tarDir(srcDir string, w io.Writer) error {
 		_, err = io.Copy(tw, f)
 		return err
 	})
-}
-
-type targetInstance struct {
-	Name string
-	IP   string
-}
-
-func findTargetInstance(ctx context.Context, client *aws.Client, appName, envName, region string) (*targetInstance, error) {
-	svc := lightsail.NewFromConfig(client.WithRegion(region).Config())
-	tagKey := fmt.Sprintf("%s%s:%s", tagPrefix, appName, envName)
-
-	var pageToken *string
-	for {
-		out, err := svc.GetInstances(ctx, &lightsail.GetInstancesInput{PageToken: pageToken})
-		if err != nil {
-			return nil, fmt.Errorf("list instances: %w", err)
-		}
-		for _, inst := range out.Instances {
-			for _, tag := range inst.Tags {
-				if tag.Key != nil && *tag.Key == tagKey {
-					ip := ""
-					if inst.PublicIpAddress != nil {
-						ip = *inst.PublicIpAddress
-					}
-					if ip == "" {
-						continue
-					}
-					return &targetInstance{Name: *inst.Name, IP: ip}, nil
-				}
-			}
-		}
-		if out.NextPageToken == nil {
-			break
-		}
-		pageToken = out.NextPageToken
-	}
-	return nil, fmt.Errorf("no instance found with tag %s", tagKey)
-}
-
-type sshCredentials struct {
-	keyPath  string
-	username string
-}
-
-func getSSHCredentials(ctx context.Context, client *aws.Client, instanceName, region string) (*sshCredentials, error) {
-	svc := lightsail.NewFromConfig(client.WithRegion(region).Config())
-	out, err := svc.GetInstanceAccessDetails(ctx, &lightsail.GetInstanceAccessDetailsInput{
-		InstanceName: &instanceName,
-		Protocol:     lstypes.InstanceAccessProtocolSsh,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("get SSH access: %w", err)
-	}
-	d := out.AccessDetails
-
-	keyFile, err := os.CreateTemp("", "nimbus-ssh-*")
-	if err != nil {
-		return nil, err
-	}
-	keyFile.Chmod(0600)
-	keyFile.WriteString(*d.PrivateKey)
-	keyFile.Close()
-
-	if d.CertKey != nil && *d.CertKey != "" {
-		os.WriteFile(keyFile.Name()+"-cert.pub", []byte(*d.CertKey), 0600)
-	}
-
-	return &sshCredentials{keyPath: keyFile.Name(), username: *d.Username}, nil
 }
 
 func findComposeFile() string {

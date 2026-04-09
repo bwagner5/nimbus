@@ -15,6 +15,7 @@ import (
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 	"github.com/wagnerbm/nimbusv2/internal/resources"
 	"github.com/wagnerbm/nimbusv2/internal/trace"
+	appsdk "github.com/wagnerbm/nimbusv2/internal/applications"
 	"github.com/wagnerbm/nimbusv2/internal/ui/applications"
 	"github.com/wagnerbm/nimbusv2/internal/ui/instances"
 	"github.com/wagnerbm/nimbusv2/internal/ui/utils"
@@ -71,7 +72,10 @@ type Model struct {
 	detailRegion    string
 	detailVP        viewport.Model
 	appCreateScreen *applications.CreateScreen
-	appDetail       *applications.AppDetail
+	appDetail       *appsdk.Detail
+	appConfirmName  string
+	appConfirmReg   string
+	deletedApps     map[string]time.Time // name -> expiry
 }
 
 func (v view) String() string {
@@ -338,6 +342,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appDetail = msg.Detail
 		m.updateDetailContent()
 
+	case applications.DeleteAppMsg:
+		m.progress = ""
+		if msg.Err != nil {
+			m.toast = utils.NewToast([]string{msg.Err.Error()})
+			return m, utils.ScheduleToastExpiry()
+		}
+		if m.deletedApps == nil {
+			m.deletedApps = make(map[string]time.Time)
+		}
+		m.deletedApps[msg.Name] = time.Now().Add(15 * time.Second)
+		m.toast = utils.NewToast([]string{fmt.Sprintf("Application '%s' deleted", msg.Name)})
+		m.applyFilter()
+		return m, utils.ScheduleToastExpiry()
+
 	// Toast / errors
 	case utils.ToastExpireMsg:
 		m.toast = utils.Toast{}
@@ -449,6 +467,21 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.view == viewConfirm && m.appConfirmName != "" {
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("y"))):
+			name, region := m.appConfirmName, m.appConfirmReg
+			m.appConfirmName = ""
+			m.view = viewResources
+			m.progress = fmt.Sprintf("Deleting %s...", name)
+			return m, applications.DeleteApp(m.ctx, m.client, name, region)
+		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
+			m.appConfirmName = ""
+			m.view = viewResources
+		}
+		return m, nil
+	}
+
 	if m.view == viewFilter {
 		return m.handleFilterKey(msg)
 	}
@@ -507,6 +540,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.view = viewConfirm
 			return m, nil
 		case key.Matches(msg, key.NewBinding(key.WithKeys("d"))):
+			if m.appDetail != nil {
+				m.appConfirmName = name
+				m.appConfirmReg = region
+				m.view = viewConfirm
+				return m, nil
+			}
 			if m.detail == nil {
 				return m, nil
 			}
@@ -738,12 +777,19 @@ func (m Model) handleStopStartKey() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleDeleteKey() (tea.Model, tea.Cmd) {
-	if m.view != viewResources || m.provider().Kind() != "lightsail/instances" || len(m.filtered) == 0 {
+	if m.view != viewResources || len(m.filtered) == 0 {
 		return m, nil
 	}
 	r := m.filtered[m.cursor]
-	m.confirm = &instances.ConfirmAction{Kind: instances.ActionDelete, Name: r.Name(), Region: r.Region()}
-	m.view = viewConfirm
+	kind := m.provider().Kind()
+	if kind == "lightsail/instances" {
+		m.confirm = &instances.ConfirmAction{Kind: instances.ActionDelete, Name: r.Name(), Region: r.Region()}
+		m.view = viewConfirm
+	} else if kind == "lightsail/applications" {
+		m.appConfirmName = r.Name()
+		m.appConfirmReg = r.Region()
+		m.view = viewConfirm
+	}
 	return m, nil
 }
 
@@ -774,6 +820,24 @@ func (m *Model) updateDetailContent() {
 
 func (m *Model) applyFilter() {
 	m.filtered = instances.ApplyFilter(m.resources, m.filter)
+	// Hide recently-deleted apps until the eventual consistency window passes
+	if len(m.deletedApps) > 0 {
+		now := time.Now()
+		for name, expiry := range m.deletedApps {
+			if now.After(expiry) {
+				delete(m.deletedApps, name)
+			}
+		}
+		if len(m.deletedApps) > 0 {
+			var kept []resources.Resource
+			for _, r := range m.filtered {
+				if _, hidden := m.deletedApps[r.Name()]; !hidden {
+					kept = append(kept, r)
+				}
+			}
+			m.filtered = kept
+		}
+	}
 	if m.cursor >= len(m.filtered) {
 		m.cursor = max(0, len(m.filtered)-1)
 	}
@@ -806,6 +870,8 @@ func (m Model) View() tea.View {
 		help := " esc:back  ↑↓:scroll  pgup/pgdn "
 		if kind == "lightsail/instances" {
 			help = " esc:back  s:stop/start  d:delete  x:shell  [/]:range  ↑↓:scroll  pgup/pgdn "
+		} else if kind == "lightsail/applications" {
+			help = " esc:back  d:delete  ↑↓:scroll  pgup/pgdn "
 		}
 		screen = utils.RenderWithStatusBar(m.detailVP.View(), help, m.width, m.height)
 	} else {
@@ -816,7 +882,11 @@ func (m Model) View() tea.View {
 		case viewProviders:
 			screen = utils.Overlay(base, instances.RenderProviderModal(m.providers, m.provCursor), m.width, m.height)
 		case viewConfirm:
-			screen = utils.Overlay(base, instances.RenderConfirmModal(m.confirm), m.width, m.height)
+			if m.appConfirmName != "" {
+				screen = utils.Overlay(base, applications.RenderAppConfirmModal(m.appConfirmName), m.width, m.height)
+			} else {
+				screen = utils.Overlay(base, instances.RenderConfirmModal(m.confirm), m.width, m.height)
+			}
 		default:
 			screen = base
 		}
