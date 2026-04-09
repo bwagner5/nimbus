@@ -15,10 +15,12 @@ import (
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 	"github.com/wagnerbm/nimbusv2/internal/resources"
 	"github.com/wagnerbm/nimbusv2/internal/trace"
+	"github.com/wagnerbm/nimbusv2/internal/ui/applications"
 	"github.com/wagnerbm/nimbusv2/internal/ui/instances"
 	"github.com/wagnerbm/nimbusv2/internal/ui/utils"
 )
 
+type appCreateDoneMsg struct{}
 type view int
 
 const (
@@ -68,6 +70,8 @@ type Model struct {
 	detailName      string
 	detailRegion    string
 	detailVP        viewport.Model
+	appCreateScreen *applications.CreateScreen
+	appDetail       *applications.AppDetail
 }
 
 func (v view) String() string {
@@ -106,6 +110,7 @@ func NewModel(logger *trace.Logger) Model {
 			resources.NewLightsailBucketProvider(client),
 			resources.NewLightsailContainerProvider(client),
 			resources.NewLightsailDistributionProvider(client),
+			resources.NewLightsailApplicationProvider(client),
 		},
 		region:     "global",
 		loading:    true,
@@ -289,6 +294,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.trace.Log("msg=RefreshTick gen=%d current=%d refreshing=%v pollRegion=%q", msg.Gen, m.refreshGen, m.refreshing, m.pollRegion)
 		return m.handleRefreshTick(msg)
 
+	// Application messages
+	case applications.AccountIDMsg, applications.InstancesMsg:
+		if m.appCreateScreen != nil {
+			m.appCreateScreen, _ = m.appCreateScreen.Update(msg)
+			if errs := m.appCreateScreen.Errors(); len(errs) > 0 {
+				m.toast = utils.NewToast(errs)
+				m.appCreateScreen.ClearErrors()
+				return m, utils.ScheduleToastExpiry()
+			}
+		}
+
+	case applications.CreateAppMsg:
+		if m.appCreateScreen != nil {
+			m.appCreateScreen, _ = m.appCreateScreen.Update(msg)
+			if m.appCreateScreen.IsComplete() {
+				return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return appCreateDoneMsg{} })
+			}
+			if msg.Err != nil {
+				m.toast = utils.NewToast([]string{msg.Err.Error()})
+				return m, utils.ScheduleToastExpiry()
+			}
+		}
+
+	case appCreateDoneMsg:
+		if m.view == viewCreate && m.appCreateScreen != nil && m.appCreateScreen.IsComplete() {
+			m.view = viewResources
+			m.appCreateScreen = nil
+			if !m.refreshing {
+				m.loading, m.refreshing = true, true
+				m.resources = nil
+				return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
+			}
+		}
+
+	case applications.AppDetailMsg:
+		m.trace.Log("msg=AppDetail err=%v", msg.Err)
+		if msg.Err != nil {
+			m.toast = utils.NewToast([]string{msg.Err.Error()})
+			m.view = viewResources
+			return m, utils.ScheduleToastExpiry()
+		}
+		m.appDetail = msg.Detail
+		m.updateDetailContent()
+
 	// Toast / errors
 	case utils.ToastExpireMsg:
 		m.toast = utils.Toast{}
@@ -299,11 +348,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading, m.progress, m.refreshing = false, "", false
 		return m, utils.ScheduleToastExpiry()
 	}
-	// Forward unhandled messages to create screen (e.g. filepicker internal msgs)
-	if m.view == viewCreate && m.createScreen != nil {
-		var cmd tea.Cmd
-		m.createScreen, cmd = m.createScreen.Update(msg)
-		return m, cmd
+	// Forward unhandled messages to active create screen (e.g. filepicker internal msgs)
+	if m.view == viewCreate {
+		if m.createScreen != nil {
+			var cmd tea.Cmd
+			m.createScreen, cmd = m.createScreen.Update(msg)
+			return m, cmd
+		}
+		if m.appCreateScreen != nil {
+			var cmd tea.Cmd
+			m.appCreateScreen, cmd = m.appCreateScreen.Update(msg)
+			return m, cmd
+		}
 	}
 	return m, nil
 }
@@ -363,6 +419,17 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
 				)
 			}
+			return m, nil
+		}
+		return m, cmd
+	}
+
+	if m.view == viewCreate && m.appCreateScreen != nil {
+		var cmd tea.Cmd
+		m.appCreateScreen, cmd = m.appCreateScreen.Update(msg)
+		if m.appCreateScreen.IsCancelled() || m.appCreateScreen.IsComplete() {
+			m.view = viewResources
+			m.appCreateScreen = nil
 			return m, nil
 		}
 		return m, cmd
@@ -547,21 +614,36 @@ func (m Model) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
-	if m.view == viewResources && m.provider().Kind() == "lightsail/instances" && len(m.filtered) > 0 {
+	if m.view == viewResources && len(m.filtered) > 0 {
+		kind := m.provider().Kind()
 		r := m.filtered[m.cursor]
-		m.view = viewDetail
-		m.detail = nil
-		m.metrics = nil
-		m.detailName = r.Name()
-		m.detailRegion = r.Region()
-		m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))
-		// Disable viewport keys that conflict with our bindings
-		m.detailVP.KeyMap.HalfPageDown.SetEnabled(false) // 'd' conflicts with delete
-		mr := instances.MetricRanges[m.metricRange]
-		return m, tea.Batch(
-			instances.FetchInstanceDetail(m.ctx, m.client, r.Name(), r.Region()),
-			instances.FetchMetrics(m.ctx, m.client, r.Name(), r.Region(), mr),
-		)
+		if kind == "lightsail/instances" {
+			m.view = viewDetail
+			m.detail = nil
+			m.metrics = nil
+			m.detailName = r.Name()
+			m.detailRegion = r.Region()
+			m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))
+			m.detailVP.KeyMap.HalfPageDown.SetEnabled(false)
+			mr := instances.MetricRanges[m.metricRange]
+			return m, tea.Batch(
+				instances.FetchInstanceDetail(m.ctx, m.client, r.Name(), r.Region()),
+				instances.FetchMetrics(m.ctx, m.client, r.Name(), r.Region(), mr),
+			)
+		}
+		if kind == "lightsail/applications" {
+			m.view = viewDetail
+			m.appDetail = nil
+			m.detailName = r.Name()
+			m.detailRegion = r.Region()
+			m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))
+			// Get bucket name from the resource
+			bucketName := ""
+			if app, ok := r.(resources.LightsailApplication); ok {
+				bucketName = app.Bucket()
+			}
+			return m, applications.FetchAppDetail(m.ctx, m.client, r.Name(), bucketName, r.Region())
+		}
 	}
 	if m.view == viewRegions {
 		m.cancel()
@@ -617,19 +699,28 @@ func (m *Model) moveCursor(dir int) {
 }
 
 func (m Model) handleCreateKey() (tea.Model, tea.Cmd) {
-	if m.view != viewResources || m.provider().Kind() != "lightsail/instances" {
-		m.trace.Log("handleCreateKey: skipped view=%s provider=%s", m.view, m.provider().Kind())
+	if m.view != viewResources {
 		return m, nil
 	}
+	kind := m.provider().Kind()
 	region := m.region
 	if region == "global" {
 		region = m.client.DefaultRegion()
 	}
-	m.trace.Log("handleCreateKey: creating screen region=%s", region)
-	m.createScreen = instances.NewCreateScreen(m.client, region, context.Background())
-	m.createScreen.SetSize(m.width, m.height)
-	m.view = viewCreate
-	return m, m.createScreen.Init()
+	m.trace.Log("handleCreateKey: provider=%s region=%s", kind, region)
+	switch kind {
+	case "lightsail/instances":
+		m.createScreen = instances.NewCreateScreen(m.client, region, context.Background())
+		m.createScreen.SetSize(m.width, m.height)
+		m.view = viewCreate
+		return m, m.createScreen.Init()
+	case "lightsail/applications":
+		m.appCreateScreen = applications.NewCreateScreen(m.client, region, context.Background())
+		m.appCreateScreen.SetSize(m.width, m.height)
+		m.view = viewCreate
+		return m, m.appCreateScreen.Init()
+	}
+	return m, nil
 }
 
 func (m Model) handleStopStartKey() (tea.Model, tea.Cmd) {
@@ -670,7 +761,12 @@ func (m Model) handleShellKey() (tea.Model, tea.Cmd) {
 // --- Helpers ---
 
 func (m *Model) updateDetailContent() {
-	content := instances.RenderInstanceDetail(m.detail, m.metrics, m.metricsLoading, m.metricRange, m.width)
+	var content string
+	if m.provider().Kind() == "lightsail/applications" {
+		content = applications.RenderAppDetail(m.appDetail, m.width)
+	} else {
+		content = instances.RenderInstanceDetail(m.detail, m.metrics, m.metricsLoading, m.metricRange, m.width)
+	}
 	m.detailVP.SetContent(content)
 	m.trace.Log("updateDetailContent: contentLines=%d vpHeight=%d vpWidth=%d totalLines=%d",
 		strings.Count(content, "\n")+1, m.detailVP.Height(), m.detailVP.Width(), m.detailVP.TotalLineCount())
@@ -687,16 +783,33 @@ func (m *Model) applyFilter() {
 
 func (m Model) View() tea.View {
 	var screen string
-	if m.view == viewCreate && m.createScreen != nil {
-		content := m.createScreen.View()
-		m.trace.Log("View: create screen len(content)=%d width=%d height=%d", len(content), m.width, m.height)
-		base := instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
-		screen = utils.Overlay(base, content, m.width, m.height)
+	kind := m.provider().Kind()
+
+	// Render base list based on provider type
+	renderBase := func() string {
+		if kind == "lightsail/applications" {
+			return applications.RenderApplications(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
+		}
+		return instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
+	}
+
+	if m.view == viewCreate {
+		base := renderBase()
+		if m.createScreen != nil {
+			screen = utils.Overlay(base, m.createScreen.View(), m.width, m.height)
+		} else if m.appCreateScreen != nil {
+			screen = utils.Overlay(base, m.appCreateScreen.View(), m.width, m.height)
+		} else {
+			screen = base
+		}
 	} else if m.view == viewDetail {
-		help := " esc:back  s:stop/start  d:delete  x:shell  [/]:range  ↑↓:scroll  pgup/pgdn "
+		help := " esc:back  ↑↓:scroll  pgup/pgdn "
+		if kind == "lightsail/instances" {
+			help = " esc:back  s:stop/start  d:delete  x:shell  [/]:range  ↑↓:scroll  pgup/pgdn "
+		}
 		screen = utils.RenderWithStatusBar(m.detailVP.View(), help, m.width, m.height)
 	} else {
-		base := instances.RenderResources(m.provider(), m.filtered, m.cursor, m.region, m.filter, m.progress, m.spinner.View(), m.width, m.height, m.loading, m.view == viewFilter)
+		base := renderBase()
 		switch m.view {
 		case viewRegions:
 			screen = utils.Overlay(base, instances.RenderRegionModal(m.regions, m.regCursor), m.width, m.height)
