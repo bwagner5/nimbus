@@ -46,6 +46,11 @@ func (t Toast) View(width int) string {
 		return ""
 	}
 	text := " ⚠ " + strings.Join(t.messages, " │ ")
+	// Truncate to fit width (accounting for padding)
+	maxLen := width - 4
+	if maxLen > 0 && len(text) > maxLen {
+		text = text[:maxLen-1] + "…"
+	}
 	return ToastStyle.Width(width).Render(text)
 }
 

@@ -45,6 +45,7 @@ type CreateScreen struct {
 	gotBlueprints bool
 	filePicker    *filepicker.Model
 	editorTmp     string // temp file path for editor
+	width         int
 }
 
 // BundlesMsg carries fetched bundle data.
@@ -542,7 +543,7 @@ func (s *CreateScreen) View() string {
 		if s.result.Success {
 			return utils.RunningStyle.Render("✓ " + s.result.Message)
 		}
-		return utils.ErrorStyle.Render("✗ Error: "+s.result.Err.Error()) + "\n\n" + utils.HelpStyle.Render("  Press esc to go back")
+		return utils.ErrorStyle.Width(max(40, s.width-10)).Render("✗ Error: "+s.result.Err.Error()) + "\n\n" + utils.HelpStyle.Render("  Press esc to go back")
 	}
 	if s.filePicker != nil {
 		return utils.TitleStyle.Render("  Select Script File") + "\n\n" + s.filePicker.View() + "\n\n" + utils.HelpStyle.Render("  enter:select  esc:cancel")
@@ -554,6 +555,7 @@ func (s *CreateScreen) View() string {
 }
 
 func (s *CreateScreen) SetSize(w, h int) {
+	s.width = w
 	if s.wizard != nil {
 		s.wizard.SetSize(w, h)
 	}

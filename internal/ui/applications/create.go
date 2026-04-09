@@ -18,18 +18,36 @@ type CreateScreen struct {
 	ctx          context.Context
 	accountID    string
 	creating     bool
+	progress     *utils.StepProgress
 	result       *CreateAppMsg
 	loaded       bool
 	instances    []applications.Target
 	gotAccount   bool
 	gotInstances bool
 	errors       []string
+	width        int
+	// stored from wizard for multi-step create
+	appName string
+	envName string
+	target  string
+	// intermediate state for chained target steps
+	targetKeyID  string
+	targetSecret string
 }
 
 // InstancesMsg carries available instances for target selection.
 type InstancesMsg struct {
 	Instances []applications.Target
 	Err       error
+}
+
+// internal step messages
+type createBucketDoneMsg struct{ Err error }
+type tagTargetDoneMsg struct{ Err error }
+type createKeyDoneMsg struct {
+	Err    error
+	KeyID  string
+	Secret string
 }
 
 func NewCreateScreen(client *aws.Client, region string, ctx context.Context) *CreateScreen {
@@ -74,7 +92,7 @@ func (s *CreateScreen) initWizard() {
 func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
-		if s.result != nil {
+		if (s.progress != nil && s.progress.Failed()) || (s.result != nil) {
 			if msg.String() == "esc" || msg.String() == "ctrl+c" {
 				s.wizard.SetCancelled()
 				return s, nil
@@ -102,8 +120,66 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 			s.initWizard()
 			s.loaded = true
 		}
+
+	// Step: create bucket
+	case createBucketDoneMsg:
+		if msg.Err != nil {
+			s.progress.Fail(0, msg.Err)
+			s.creating = false
+			return s, nil
+		}
+		s.progress.Complete(0)
+		if s.target != "" && s.target != "skip" {
+			s.progress.Start(1)
+			s.progress.StartSub(1, 0)
+			return s, s.doTagTarget()
+		}
+		// No target — signal completion via message
+		appName := s.appName
+		return s, func() tea.Msg { return CreateAppMsg{Name: appName} }
+
+	// Sub-step: tag target
+	case tagTargetDoneMsg:
+		if msg.Err != nil {
+			s.progress.Fail(1, msg.Err)
+			s.creating = false
+			return s, nil
+		}
+		s.progress.CompleteSub(1, 0)
+		s.progress.StartSub(1, 1)
+		return s, s.doCreateKey()
+
+	// Sub-step: create access key
+	case createKeyDoneMsg:
+		if msg.Err != nil {
+			s.progress.Fail(1, msg.Err)
+			s.creating = false
+			return s, nil
+		}
+		s.targetKeyID = msg.KeyID
+		s.targetSecret = msg.Secret
+		s.progress.CompleteSub(1, 1)
+		s.progress.StartSub(1, 2)
+		return s, s.doWriteCreds()
+
+	// Final: add target complete
 	case CreateAppMsg:
 		s.creating = false
+		if msg.Err != nil {
+			if s.progress != nil {
+				for i := range s.progress.Steps {
+					if s.progress.Steps[i].State == utils.StepRunning {
+						s.progress.Fail(i, msg.Err)
+						break
+					}
+				}
+			}
+			return s, nil
+		}
+		if s.progress != nil {
+			s.progress.CompleteSub(1, 2)
+			s.progress.Complete(1)
+		}
 		s.result = &msg
 		return s, nil
 	}
@@ -111,7 +187,7 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 	if !s.loaded || s.creating {
 		return s, nil
 	}
-	if s.result != nil {
+	if s.result != nil || (s.progress != nil && s.progress.Failed()) {
 		return s, nil
 	}
 
@@ -119,58 +195,108 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 	s.wizard, cmd = s.wizard.Update(msg)
 
 	if s.wizard.IsCompleted() {
-		return s, s.createApp()
+		return s, s.startCreate()
 	}
 
 	return s, cmd
 }
 
-func (s *CreateScreen) createApp() tea.Cmd {
+func (s *CreateScreen) startCreate() tea.Cmd {
 	s.creating = true
 	vals := s.wizard.Values()
-	appName := vals["name"]
-	envName := vals["env"]
-	target := vals["target"]
+	s.appName = vals["name"]
+	s.envName = vals["env"]
+	s.target = vals["target"]
+
+	labels := []string{fmt.Sprintf("Create bucket for %s/%s", s.appName, s.envName)}
+	if s.target != "" && s.target != "skip" {
+		labels = append(labels, fmt.Sprintf("Add target %s", s.target))
+	}
+	s.progress = utils.NewStepProgress("Creating Application", labels...)
+	if s.target != "" && s.target != "skip" {
+		s.progress.SetSubSteps(1, "Tag instance", "Create access key", "Write credentials to instance")
+	}
+	s.progress.Start(0)
 
 	client := s.client
 	accountID := s.accountID
+	appName := s.appName
+	envName := s.envName
 	region := s.region
 	ctx := s.ctx
 
 	return func() tea.Msg {
-		appClient := applications.NewClient(client)
-		if err := appClient.Create(ctx, accountID, appName, region); err != nil {
+		err := applications.NewClient(client).Create(ctx, accountID, appName, envName, region)
+		return createBucketDoneMsg{Err: err}
+	}
+}
+
+func (s *CreateScreen) doTagTarget() tea.Cmd {
+	client, target, appName, envName, region, ctx := s.client, s.target, s.appName, s.envName, s.region, s.ctx
+	return func() tea.Msg {
+		err := applications.NewClient(client).TagTarget(ctx, target, appName, envName, region)
+		return tagTargetDoneMsg{Err: err}
+	}
+}
+
+func (s *CreateScreen) doCreateKey() tea.Cmd {
+	client, appName, envName, accountID, region, ctx := s.client, s.appName, s.envName, s.accountID, s.region, s.ctx
+	return func() tea.Msg {
+		keyID, secret, err := applications.NewClient(client).CreateTargetKey(ctx, appName, envName, accountID, region)
+		return createKeyDoneMsg{Err: err, KeyID: keyID, Secret: secret}
+	}
+}
+
+func (s *CreateScreen) doWriteCreds() tea.Cmd {
+	client := s.client
+	target, appName, envName := s.target, s.appName, s.envName
+	keyID, secret := s.targetKeyID, s.targetSecret
+	accountID, region, ctx := s.accountID, s.region, s.ctx
+	bucketName := applications.BucketName(accountID, appName, envName)
+	return func() tea.Msg {
+		err := applications.NewClient(client).WriteTargetCredentials(ctx, target, appName, envName, keyID, secret, bucketName, region)
+		if err != nil {
 			return CreateAppMsg{Err: err, Name: appName}
-		}
-		if target != "" && target != "skip" {
-			appClient.AddTarget(ctx, target, appName, envName, region)
 		}
 		return CreateAppMsg{Name: appName}
 	}
 }
 
-func (s *CreateScreen) IsCancelled() bool { return s.wizard != nil && s.wizard.IsCancelled() }
-func (s *CreateScreen) IsComplete() bool  { return s.result != nil && s.result.Err == nil }
-func (s *CreateScreen) Errors() []string  { return s.errors }
-func (s *CreateScreen) ClearErrors()      { s.errors = nil }
+func (s *CreateScreen) IsCancelled() bool {
+	return s.wizard != nil && s.wizard.IsCancelled()
+}
+func (s *CreateScreen) IsComplete() bool { return s.result != nil && s.result.Err == nil }
+func (s *CreateScreen) Errors() []string { return s.errors }
+func (s *CreateScreen) ClearErrors()     { s.errors = nil }
+
+// Progress returns the step progress for external rendering (needs spinner).
+func (s *CreateScreen) Progress() *utils.StepProgress { return s.progress }
+func (s *CreateScreen) Creating() bool                { return s.creating }
+func (s *CreateScreen) AppName() string               { return s.appName }
+func (s *CreateScreen) EnvName() string               { return s.envName }
+func (s *CreateScreen) Region() string                { return s.region }
 
 func (s *CreateScreen) View() string {
+	return s.ViewWithSpinner("")
+}
+
+// ViewWithSpinner renders the screen, using the provided spinner frame for progress.
+func (s *CreateScreen) ViewWithSpinner(spinnerView string) string {
 	if !s.loaded {
-		return utils.TitleStyle.Render(" Loading application options... ")
+		return utils.TitleStyle.Render(fmt.Sprintf(" %s Loading application options... ", spinnerView))
 	}
-	if s.creating {
-		return utils.TitleStyle.Render(" Creating application... ")
-	}
-	if s.result != nil {
-		if s.result.Err == nil {
-			return utils.RunningStyle.Render(fmt.Sprintf("✓ Application '%s' created!", s.result.Name))
+	if s.progress != nil && (s.creating || s.progress.Failed() || s.progress.Done()) {
+		if s.progress.Done() && s.result != nil && s.result.Err == nil {
+			return s.progress.View(spinnerView, s.width) + "\n" +
+				utils.RunningStyle.Render(fmt.Sprintf("  ✓ Application '%s' created!", s.result.Name))
 		}
-		return utils.ErrorStyle.Render("✗ Error: "+s.result.Err.Error()) + "\n\n" + utils.HelpStyle.Render("  Press esc to go back")
+		return s.progress.View(spinnerView, s.width)
 	}
 	return s.wizard.View()
 }
 
 func (s *CreateScreen) SetSize(w, h int) {
+	s.width = w
 	if s.wizard != nil {
 		s.wizard.SetSize(w, h)
 	}

@@ -328,7 +328,7 @@ func (w *Wizard) View() string {
 	}
 
 	if w.err != "" {
-		b.WriteString("\n" + ErrorStyle.Render("  ⚠ "+w.err))
+		b.WriteString("\n" + ErrorStyle.Width(max(40, w.width-6)).Render("  ⚠ "+w.err))
 	}
 
 	b.WriteString("\n\n" + w.renderHelp())

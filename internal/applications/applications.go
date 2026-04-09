@@ -4,12 +4,17 @@ package applications
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 	lstypes "github.com/aws/aws-sdk-go-v2/service/lightsail/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
 )
@@ -22,23 +27,50 @@ const (
 // App represents a discovered nimbus application.
 type App struct {
 	Name   string
-	Bucket string
+	Bucket string // first env bucket (for backward compat display)
 	Region string
 	State  string
+	Envs   []string
 }
 
 // Environment represents an app environment parsed from instance tags.
 type Environment struct {
 	Name    string
+	Bucket  string
 	Targets []Target
 }
 
 // Target is a Lightsail instance associated with an app/env.
 type Target struct {
-	Name   string
-	State  string
-	IP     string
-	Region string
+	Name           string
+	State          string
+	IP             string
+	Region         string
+	InstanceStatus *InstanceStatus
+}
+
+// InstanceStatus is the status file uploaded by the watch process.
+type InstanceStatus struct {
+	Instance   string            `json:"instance"`
+	Timestamp  time.Time         `json:"timestamp"`
+	Status     string            `json:"status"`
+	LastDeploy *DeployInfo       `json:"last_deploy"`
+	Containers []ContainerStatus `json:"containers"`
+	Endpoints  []string          `json:"endpoints"`
+}
+
+// DeployInfo describes the last deployed asset.
+type DeployInfo struct {
+	Timestamp time.Time `json:"timestamp"`
+	ObjectURL string    `json:"object_url"`
+}
+
+// ContainerStatus describes a running container.
+type ContainerStatus struct {
+	Name      string    `json:"name"`
+	Image     string    `json:"image"`
+	Status    string    `json:"status"`
+	StartedAt time.Time `json:"started_at"`
 }
 
 // Detail holds full application detail including environments.
@@ -74,38 +106,46 @@ func (c *Client) AccountID(ctx context.Context) (string, error) {
 	return *out.Account, nil
 }
 
-// BucketName returns the expected bucket name for an app given an account ID.
-func BucketName(accountID, appName string) string {
-	return fmt.Sprintf("%s%s-%s", BucketPrefix, accountID, appName)
+// BucketName returns the bucket name for an app-env: ls-app-<account>-<app>-<env>.
+func BucketName(accountID, appName, envName string) string {
+	return fmt.Sprintf("%s%s-%s-%s", BucketPrefix, accountID, appName, envName)
 }
 
-// ParseAppName extracts the app name from a bucket name like ls-app-123456-myapp.
+// ParseAppName extracts just the app name from a bucket name.
+// For ls-app-<account>-<app>-<env> it returns <app>.
 func ParseAppName(bucketName string) string {
+	app, _ := ParseAppEnv(bucketName)
+	return app
+}
+
+// ParseAppEnv extracts app name and env from a bucket name like ls-app-<account>-<app>-<env>.
+func ParseAppEnv(bucketName string) (appName, envName string) {
 	if !strings.HasPrefix(bucketName, BucketPrefix) {
-		return ""
+		return "", ""
 	}
 	rest := strings.TrimPrefix(bucketName, BucketPrefix)
-	parts := strings.SplitN(rest, "-", 2)
-	if len(parts) < 2 {
-		return ""
+	// rest = "<account>-<app>-<env>"
+	parts := strings.SplitN(rest, "-", 3)
+	if len(parts) < 3 {
+		return "", ""
 	}
-	return parts[1]
+	return parts[1], parts[2]
 }
 
-// List returns all nimbus applications in the given region.
+// List returns all nimbus applications in the given region, grouped by app name.
 func (c *Client) List(ctx context.Context, region string) ([]App, error) {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
 	out, err := svc.GetBuckets(ctx, &lightsail.GetBucketsInput{})
 	if err != nil {
 		return nil, err
 	}
-	var apps []App
+	appMap := map[string]*App{}
 	for _, b := range out.Buckets {
 		if b.Name == nil || !strings.HasPrefix(*b.Name, BucketPrefix) {
 			continue
 		}
-		name := ParseAppName(*b.Name)
-		if name == "" {
+		name, env := ParseAppEnv(*b.Name)
+		if name == "" || env == "" {
 			continue
 		}
 		state := "active"
@@ -116,24 +156,48 @@ func (c *Client) List(ctx context.Context, region string) ([]App, error) {
 		if b.Location != nil {
 			r = string(b.Location.RegionName)
 		}
-		apps = append(apps, App{Name: name, Bucket: *b.Name, Region: r, State: state})
+		if a, ok := appMap[name]; ok {
+			a.Envs = append(a.Envs, env)
+			if state != "active" {
+				a.State = state
+			}
+		} else {
+			appMap[name] = &App{Name: name, Bucket: *b.Name, Region: r, State: state, Envs: []string{env}}
+		}
+	}
+	var apps []App
+	for _, a := range appMap {
+		apps = append(apps, *a)
 	}
 	return apps, nil
 }
 
-// GetDetail fetches full application detail including environments and targets.
+// GetDetail fetches full application detail including environments, targets, and status.
 func (c *Client) GetDetail(ctx context.Context, appName, bucketName, region string) (*Detail, error) {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
 
-	buckOut, err := svc.GetBuckets(ctx, &lightsail.GetBucketsInput{BucketName: &bucketName})
+	// Find all env buckets for this app
+	allBuckets, err := svc.GetBuckets(ctx, &lightsail.GetBucketsInput{})
 	if err != nil {
 		return nil, err
 	}
+	envBuckets := map[string]string{} // env -> bucket name
 	state := "active"
-	if len(buckOut.Buckets) > 0 && buckOut.Buckets[0].State != nil && buckOut.Buckets[0].State.Code != nil {
-		state = *buckOut.Buckets[0].State.Code
+	for _, b := range allBuckets.Buckets {
+		if b.Name == nil || !strings.HasPrefix(*b.Name, BucketPrefix) {
+			continue
+		}
+		bApp, bEnv := ParseAppEnv(*b.Name)
+		if bApp != appName {
+			continue
+		}
+		envBuckets[bEnv] = *b.Name
+		if b.State != nil && b.State.Code != nil && *b.State.Code != "active" {
+			state = *b.State.Code
+		}
 	}
 
+	// Build environments from instance tags
 	envMap := map[string]*Environment{}
 	prefix := TagPrefix + appName + ":"
 	c.forEachInstance(ctx, svc, func(inst lstypes.Instance) {
@@ -147,28 +211,90 @@ func (c *Client) GetDetail(ctx context.Context, appName, bucketName, region stri
 			}
 			env, ok := envMap[envName]
 			if !ok {
-				env = &Environment{Name: envName}
+				env = &Environment{Name: envName, Bucket: envBuckets[envName]}
 				envMap[envName] = env
 			}
 			env.Targets = append(env.Targets, instanceToTarget(inst, region))
 		}
 	})
 
+	// Ensure envs with buckets but no targets still appear
+	for envName, bkt := range envBuckets {
+		if _, ok := envMap[envName]; !ok {
+			envMap[envName] = &Environment{Name: envName, Bucket: bkt}
+		}
+	}
+
+	// Fetch status files from each env bucket
+	s3svc := s3.NewFromConfig(c.aws.WithRegion(region).Config())
+	for _, env := range envMap {
+		if env.Bucket == "" {
+			continue
+		}
+		c.fetchEnvStatuses(ctx, s3svc, env)
+	}
+
 	var envs []Environment
 	for _, e := range envMap {
 		envs = append(envs, *e)
 	}
 
+	displayBucket := bucketName
+	if displayBucket == "" && len(envBuckets) > 0 {
+		for _, b := range envBuckets {
+			displayBucket = b
+			break
+		}
+	}
+
 	return &Detail{
-		App:          App{Name: appName, Bucket: bucketName, Region: region, State: state},
+		App:          App{Name: appName, Bucket: displayBucket, Region: region, State: state},
 		Environments: envs,
 	}, nil
 }
 
-// Create creates a new application bucket.
-func (c *Client) Create(ctx context.Context, accountID, appName, region string) error {
+// fetchEnvStatuses downloads *_status.json files from a bucket and attaches to matching targets.
+func (c *Client) fetchEnvStatuses(ctx context.Context, s3svc *s3.Client, env *Environment) {
+	listOut, err := s3svc.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: &env.Bucket,
+		Prefix: strPtr(""),
+	})
+	if err != nil {
+		return
+	}
+	for _, obj := range listOut.Contents {
+		if obj.Key == nil || !strings.HasSuffix(*obj.Key, "_status.json") {
+			continue
+		}
+		getOut, err := s3svc.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &env.Bucket,
+			Key:    obj.Key,
+		})
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(getOut.Body)
+		getOut.Body.Close()
+		if err != nil {
+			continue
+		}
+		var status InstanceStatus
+		if json.Unmarshal(data, &status) != nil {
+			continue
+		}
+		// Attach to matching target
+		for i := range env.Targets {
+			if env.Targets[i].Name == status.Instance {
+				env.Targets[i].InstanceStatus = &status
+			}
+		}
+	}
+}
+
+// Create creates a new application bucket for the given env.
+func (c *Client) Create(ctx context.Context, accountID, appName, envName, region string) error {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
-	bucketName := BucketName(accountID, appName)
+	bucketName := BucketName(accountID, appName, envName)
 	bundleID := "small_1_0"
 	_, err := svc.CreateBucket(ctx, &lightsail.CreateBucketInput{
 		BucketName: &bucketName,
@@ -177,12 +303,18 @@ func (c *Client) Create(ctx context.Context, accountID, appName, region string) 
 	return err
 }
 
-// Delete removes all instance tags for the app and deletes the bucket.
+// Delete removes all instance tags for the app and deletes all env buckets.
 func (c *Client) Delete(ctx context.Context, appName, region string) error {
+	if err := c.DeleteTags(ctx, appName, region); err != nil {
+		return err
+	}
+	return c.DeleteBuckets(ctx, appName, region)
+}
+
+// DeleteTags removes all instance tags for the app.
+func (c *Client) DeleteTags(ctx context.Context, appName, region string) error {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
 	prefix := TagPrefix + appName + ":"
-
-	// Remove tags from instances
 	c.forEachInstance(ctx, svc, func(inst lstypes.Instance) {
 		var keys []string
 		for _, tag := range inst.Tags {
@@ -197,23 +329,48 @@ func (c *Client) Delete(ctx context.Context, appName, region string) error {
 			})
 		}
 	})
+	return nil
+}
 
-	// Resolve and delete bucket
-	accountID, err := c.AccountID(ctx)
+// DeleteBuckets deletes all env buckets for the app.
+func (c *Client) DeleteBuckets(ctx context.Context, appName, region string) error {
+	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
+	allBuckets, err := svc.GetBuckets(ctx, &lightsail.GetBucketsInput{})
 	if err != nil {
 		return err
 	}
-	bucketName := BucketName(accountID, appName)
 	forceDelete := true
-	_, err = svc.DeleteBucket(ctx, &lightsail.DeleteBucketInput{
-		BucketName:  &bucketName,
-		ForceDelete: &forceDelete,
-	})
-	return err
+	for _, b := range allBuckets.Buckets {
+		if b.Name == nil {
+			continue
+		}
+		bApp, _ := ParseAppEnv(*b.Name)
+		if bApp != appName {
+			continue
+		}
+		svc.DeleteBucket(ctx, &lightsail.DeleteBucketInput{
+			BucketName:  b.Name,
+			ForceDelete: &forceDelete,
+		})
+	}
+	return nil
 }
 
-// AddTarget tags an instance as a deployment target for an app/env.
-func (c *Client) AddTarget(ctx context.Context, instanceName, appName, envName, region string) error {
+// AddTarget tags an instance as a deployment target for an app/env, creates a
+// bucket access key, and writes credentials to the instance via SSH.
+func (c *Client) AddTarget(ctx context.Context, instanceName, appName, envName, accountID, region string) error {
+	if err := c.TagTarget(ctx, instanceName, appName, envName, region); err != nil {
+		return err
+	}
+	keyID, secret, err := c.CreateTargetKey(ctx, appName, envName, accountID, region)
+	if err != nil {
+		return err
+	}
+	return c.WriteTargetCredentials(ctx, instanceName, appName, envName, keyID, secret, BucketName(accountID, appName, envName), region)
+}
+
+// TagTarget tags an instance as a deployment target for an app/env.
+func (c *Client) TagTarget(ctx context.Context, instanceName, appName, envName, region string) error {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
 	tagKey := fmt.Sprintf("%s%s:%s", TagPrefix, appName, envName)
 	tagVal := "true"
@@ -222,6 +379,82 @@ func (c *Client) AddTarget(ctx context.Context, instanceName, appName, envName, 
 		Tags:         []lstypes.Tag{{Key: &tagKey, Value: &tagVal}},
 	})
 	return err
+}
+
+// CreateTargetKey creates a bucket access key for the target instance.
+func (c *Client) CreateTargetKey(ctx context.Context, appName, envName, accountID, region string) (keyID, secret string, err error) {
+	bucketName := BucketName(accountID, appName, envName)
+	return c.CreateBucketAccessKey(ctx, bucketName, region)
+}
+
+// WriteTargetCredentials SSHes to the instance and writes credentials files.
+func (c *Client) WriteTargetCredentials(ctx context.Context, instanceName, appName, envName, keyID, secret, bucketName, region string) error {
+	creds, err := c.GetSSHCredentials(ctx, instanceName, region)
+	if err != nil {
+		return fmt.Errorf("get SSH credentials: %w", err)
+	}
+	defer os.Remove(creds.KeyPath)
+	defer os.Remove(creds.KeyPath + "-cert.pub")
+
+	// Write .credentials and .bucket to the instance
+	remoteDir := fmt.Sprintf("/opt/nimbus/%s/%s", appName, envName)
+	credContent := fmt.Sprintf("AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_DEFAULT_REGION=%s\n", keyID, secret, region)
+	remoteCmd := fmt.Sprintf(
+		"sudo mkdir -p %s && echo '%s' | sudo tee %s/.credentials > /dev/null && sudo chmod 600 %s/.credentials && echo '%s' | sudo tee %s/.bucket > /dev/null",
+		remoteDir, credContent, remoteDir, remoteDir, bucketName, remoteDir,
+	)
+
+	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
+	sshOpts := []string{"-i", creds.KeyPath, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"}
+	cmd := exec.Command("ssh", append(sshOpts, sshTarget, remoteCmd)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("write credentials to instance: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+
+	return nil
+}
+
+// RemoveTarget removes an instance's association tag for an app/env.
+// If cleanup is true, it SSHes to the instance to stop the watch service and remove deploy dirs.
+func (c *Client) RemoveTarget(ctx context.Context, instanceName, appName, envName, region string, cleanup bool) error {
+	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
+	tagKey := fmt.Sprintf("%s%s:%s", TagPrefix, appName, envName)
+	_, err := svc.UntagResource(ctx, &lightsail.UntagResourceInput{
+		ResourceName: &instanceName,
+		TagKeys:      []string{tagKey},
+	})
+	if err != nil {
+		return err
+	}
+
+	if !cleanup {
+		return nil
+	}
+
+	// SSH to instance and clean up
+	creds, err := c.GetSSHCredentials(ctx, instanceName, region)
+	if err != nil {
+		return nil // tag removed, cleanup is best-effort
+	}
+	defer os.Remove(creds.KeyPath)
+	defer os.Remove(creds.KeyPath + "-cert.pub")
+
+	svcName := fmt.Sprintf("nimbus-watch-%s-%s", appName, envName)
+	envDir := fmt.Sprintf("/opt/nimbus/%s/%s", appName, envName)
+	appDir := fmt.Sprintf("/opt/nimbus/%s", appName)
+
+	// Stop service, remove unit, remove env dir, remove app dir if empty
+	remoteCmd := fmt.Sprintf(
+		"sudo systemctl stop %s 2>/dev/null; sudo systemctl disable %s 2>/dev/null; sudo rm -f /etc/systemd/system/%s.service; sudo systemctl daemon-reload; sudo rm -rf %s; sudo rmdir %s 2>/dev/null; true",
+		svcName, svcName, svcName, envDir, appDir,
+	)
+
+	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
+	sshOpts := []string{"-i", creds.KeyPath, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"}
+	cmd := exec.Command("ssh", append(sshOpts, sshTarget, remoteCmd)...)
+	cmd.CombinedOutput() // best-effort
+
+	return nil
 }
 
 // FindTarget finds the first instance tagged for the given app/env and returns it.
@@ -248,6 +481,28 @@ func (c *Client) FindTarget(ctx context.Context, appName, envName, region string
 		return nil, fmt.Errorf("no instance found with tag %s", tagKey)
 	}
 	return found, nil
+}
+
+// CreateBucketAccessKey creates a short-lived access key for external bucket access.
+func (c *Client) CreateBucketAccessKey(ctx context.Context, bucketName, region string) (accessKeyID, secretKey string, err error) {
+	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
+	out, err := svc.CreateBucketAccessKey(ctx, &lightsail.CreateBucketAccessKeyInput{
+		BucketName: &bucketName,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("create bucket access key: %w", err)
+	}
+	return *out.AccessKey.AccessKeyId, *out.AccessKey.SecretAccessKey, nil
+}
+
+// DeleteBucketAccessKey removes a bucket access key.
+func (c *Client) DeleteBucketAccessKey(ctx context.Context, bucketName, accessKeyID, region string) error {
+	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
+	_, err := svc.DeleteBucketAccessKey(ctx, &lightsail.DeleteBucketAccessKeyInput{
+		BucketName:  &bucketName,
+		AccessKeyId: &accessKeyID,
+	})
+	return err
 }
 
 // GetSSHCredentials fetches temporary SSH credentials for an instance.
@@ -287,6 +542,51 @@ func (c *Client) ListInstances(ctx context.Context, region string) ([]Target, er
 	return targets, nil
 }
 
+// InstallWatchService writes and enables a systemd unit for the watch loop.
+// It reads credentials from /opt/nimbus/<app>/<env>/.credentials (written by AddTarget).
+func InstallWatchService(appName, envName string) error {
+	credsPath := fmt.Sprintf("/opt/nimbus/%s/%s/.credentials", appName, envName)
+	if _, err := os.Stat(credsPath); err != nil {
+		return fmt.Errorf("credentials file not found at %s — run add-target first: %w", credsPath, err)
+	}
+
+	unit := fmt.Sprintf(`[Unit]
+Description=Nimbus deployment watcher for %s/%s
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/nimbus/%s/%s/.credentials
+ExecStart=/usr/local/bin/nimbus application watch --name %s --env %s
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+`, appName, envName, appName, envName, appName, envName)
+
+	svcName := fmt.Sprintf("nimbus-watch-%s-%s", appName, envName)
+	path := fmt.Sprintf("/etc/systemd/system/%s.service", svcName)
+	if err := os.WriteFile(path, []byte(unit), 0644); err != nil {
+		return fmt.Errorf("write unit file: %w", err)
+	}
+	if err := runSystemctl("daemon-reload"); err != nil {
+		return err
+	}
+	if err := runSystemctl("enable", svcName); err != nil {
+		return err
+	}
+	return runSystemctl("start", svcName)
+}
+
+func runSystemctl(args ...string) error {
+	cmd := exec.Command("systemctl", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 // forEachInstance iterates over all instances, handling pagination.
 func (c *Client) forEachInstance(ctx context.Context, svc *lightsail.Client, fn func(lstypes.Instance)) {
 	var pageToken *string
@@ -316,3 +616,5 @@ func instanceToTarget(inst lstypes.Instance, region string) Target {
 	}
 	return Target{Name: *inst.Name, State: state, IP: ip, Region: region}
 }
+
+func strPtr(s string) *string { return &s }

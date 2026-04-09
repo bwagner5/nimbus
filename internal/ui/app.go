@@ -22,6 +22,7 @@ import (
 )
 
 type appCreateDoneMsg struct{}
+type deleteProgressDoneMsg struct{}
 type view int
 
 const (
@@ -32,6 +33,7 @@ const (
 	viewCreate
 	viewConfirm
 	viewDetail
+	viewAddTarget
 )
 
 // Model is the top-level application model.
@@ -73,9 +75,21 @@ type Model struct {
 	detailVP        viewport.Model
 	appCreateScreen *applications.CreateScreen
 	appDetail       *appsdk.Detail
+	appDetailCursor int
+	appDetailFrom   bool // true when viewing instance detail navigated from app detail
 	appConfirmName  string
 	appConfirmReg   string
-	deletedApps     map[string]time.Time // name -> expiry
+	disassocConfirm *applications.TargetEntry // pending disassociate confirmation
+	addTargetEnv     string                   // env name for add-target modal
+	addTargetInsts   []appsdk.Target          // instances available in add-target modal
+	addTargetCursor  int
+	addTargetLoading bool
+	addTargetStatus  string
+	accountID        string                   // cached AWS account ID
+	deleteProgress   *utils.StepProgress      // step progress for app deletion
+	deleteAppName    string
+	deleteAppReg     string
+	deletedApps     map[string]time.Time      // name -> expiry
 }
 
 func (v view) String() string {
@@ -94,6 +108,8 @@ func (v view) String() string {
 		return "confirm"
 	case viewDetail:
 		return "detail"
+	case viewAddTarget:
+		return "addTarget"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(v))
 	}
@@ -299,7 +315,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleRefreshTick(msg)
 
 	// Application messages
-	case applications.AccountIDMsg, applications.InstancesMsg:
+	case applications.AccountIDMsg:
+		if msg.Err == nil {
+			m.accountID = msg.AccountID
+		}
+		if m.appCreateScreen != nil {
+			m.appCreateScreen, _ = m.appCreateScreen.Update(msg)
+			if errs := m.appCreateScreen.Errors(); len(errs) > 0 {
+				m.toast = utils.NewToast(errs)
+				m.appCreateScreen.ClearErrors()
+				return m, utils.ScheduleToastExpiry()
+			}
+		}
+
+	case applications.InstancesMsg:
+		if m.view == viewAddTarget {
+			m.addTargetLoading = false
+			if msg.Err != nil {
+				m.toast = utils.NewToast([]string{msg.Err.Error()})
+				m.view = viewDetail
+				return m, utils.ScheduleToastExpiry()
+			}
+			m.addTargetInsts = msg.Instances
+			return m, nil
+		}
 		if m.appCreateScreen != nil {
 			m.appCreateScreen, _ = m.appCreateScreen.Update(msg)
 			if errs := m.appCreateScreen.Errors(); len(errs) > 0 {
@@ -313,7 +352,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.appCreateScreen != nil {
 			m.appCreateScreen, _ = m.appCreateScreen.Update(msg)
 			if m.appCreateScreen.IsComplete() {
-				return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return appCreateDoneMsg{} })
+				return m, tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg { return appCreateDoneMsg{} })
 			}
 			if msg.Err != nil {
 				m.toast = utils.NewToast([]string{msg.Err.Error()})
@@ -325,12 +364,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view == viewCreate && m.appCreateScreen != nil && m.appCreateScreen.IsComplete() {
 			m.view = viewResources
 			m.appCreateScreen = nil
-			if !m.refreshing {
-				m.loading, m.refreshing = true, true
-				m.resources = nil
-				return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
-			}
+			m.refreshGen++
+			return m, tea.Batch(
+				instances.FetchResources(m.ctx, m.client, m.provider(), m.region),
+				instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
+			)
 		}
+
+	case deleteProgressDoneMsg:
+		m.deleteProgress = nil
 
 	case applications.AppDetailMsg:
 		m.trace.Log("msg=AppDetail err=%v", msg.Err)
@@ -340,9 +382,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, utils.ScheduleToastExpiry()
 		}
 		m.appDetail = msg.Detail
+		targets := applications.AppDetailTargets(m.appDetail)
+		if m.appDetailCursor >= len(targets) {
+			m.appDetailCursor = max(0, len(targets)-1)
+		}
 		m.updateDetailContent()
 
+	case applications.DeleteTagsDoneMsg:
+		if m.deleteProgress != nil {
+			if msg.Err != nil {
+				m.deleteProgress.Fail(0, msg.Err)
+				return m, nil
+			}
+			m.deleteProgress.Complete(0)
+			m.deleteProgress.Start(1)
+			return m, applications.DeleteAppBuckets(m.ctx, m.client, m.deleteAppName, m.deleteAppReg)
+		}
+
 	case applications.DeleteAppMsg:
+		if m.deleteProgress != nil {
+			if msg.Err != nil {
+				m.deleteProgress.Fail(1, msg.Err)
+				return m, nil
+			}
+			m.deleteProgress.Complete(1)
+		}
 		m.progress = ""
 		if msg.Err != nil {
 			m.toast = utils.NewToast([]string{msg.Err.Error()})
@@ -352,8 +416,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.deletedApps = make(map[string]time.Time)
 		}
 		m.deletedApps[msg.Name] = time.Now().Add(15 * time.Second)
-		m.toast = utils.NewToast([]string{fmt.Sprintf("Application '%s' deleted", msg.Name)})
 		m.applyFilter()
+		// Auto-dismiss after a short delay
+		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return deleteProgressDoneMsg{} })
+
+	case applications.DisassociateTargetMsg:
+		if msg.Err != nil {
+			m.toast = utils.NewToast([]string{msg.Err.Error()})
+			return m, utils.ScheduleToastExpiry()
+		}
+		m.toast = utils.NewToast([]string{fmt.Sprintf("Disassociated '%s'", msg.InstanceName)})
+		if m.appDetail != nil {
+			return m, tea.Batch(
+				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
+				utils.ScheduleToastExpiry(),
+			)
+		}
+		return m, utils.ScheduleToastExpiry()
+
+	case applications.AddTargetMsg:
+		m.addTargetLoading = false
+		if msg.Err != nil {
+			m.toast = utils.NewToast([]string{msg.Err.Error()})
+			return m, utils.ScheduleToastExpiry()
+		}
+		m.toast = utils.NewToast([]string{"Target added"})
+		if m.appDetail != nil {
+			return m, tea.Batch(
+				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
+				utils.ScheduleToastExpiry(),
+			)
+		}
 		return m, utils.ScheduleToastExpiry()
 
 	// Toast / errors
@@ -472,12 +565,60 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("y"))):
 			name, region := m.appConfirmName, m.appConfirmReg
 			m.appConfirmName = ""
+			m.deleteAppName = name
+			m.deleteAppReg = region
+			m.deleteProgress = utils.NewStepProgress(
+				fmt.Sprintf("Deleting %s", name),
+				"Remove instance tags",
+				"Delete environment buckets",
+			)
+			m.deleteProgress.Start(0)
 			m.view = viewResources
-			m.progress = fmt.Sprintf("Deleting %s...", name)
-			return m, applications.DeleteApp(m.ctx, m.client, name, region)
+			return m, applications.DeleteAppTags(m.ctx, m.client, name, region)
 		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
 			m.appConfirmName = ""
 			m.view = viewResources
+		}
+		return m, nil
+	}
+
+	if m.view == viewConfirm && m.disassocConfirm != nil {
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("y"))):
+			t := *m.disassocConfirm
+			m.disassocConfirm = nil
+			m.view = viewDetail
+			return m, applications.DisassociateTarget(m.ctx, m.client, t.Target.Name, m.appDetail.Name, t.EnvName, m.appDetail.Region)
+		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
+			m.disassocConfirm = nil
+			m.view = viewDetail
+		}
+		return m, nil
+	}
+
+	if m.view == viewAddTarget {
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+			m.view = viewDetail
+		case key.Matches(msg, key.NewBinding(key.WithKeys("j", "down"))):
+			if m.addTargetCursor < len(m.addTargetInsts)-1 {
+				m.addTargetCursor++
+			}
+		case key.Matches(msg, key.NewBinding(key.WithKeys("k", "up"))):
+			if m.addTargetCursor > 0 {
+				m.addTargetCursor--
+			}
+		case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
+			if len(m.addTargetInsts) > 0 {
+				inst := m.addTargetInsts[m.addTargetCursor]
+				m.view = viewDetail
+				m.addTargetLoading = true
+				m.addTargetStatus = fmt.Sprintf("Preparing %s...", inst.Name)
+				return m, applications.AddTargetFromDetail(m.ctx, m.client, inst.Name, m.appDetail.Name, m.addTargetEnv, m.accountID, m.appDetail.Region)
+			}
+		case key.Matches(msg, key.NewBinding(key.WithKeys("q", "ctrl+c"))):
+			m.cancel()
+			return m, tea.Quit
 		}
 		return m, nil
 	}
@@ -490,12 +631,95 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.view == viewDetail {
 		name := m.detailName
 		region := m.detailRegion
+
+		// App detail view: target selection with j/k, enter, x, d
+		if m.appDetail != nil {
+			targets := applications.AppDetailTargets(m.appDetail)
+			cur := targets[m.appDetailCursor]
+			switch {
+			case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+				m.view = viewResources
+				m.appDetail = nil
+				return m, nil
+			case key.Matches(msg, key.NewBinding(key.WithKeys("j", "down"))):
+				if m.appDetailCursor < len(targets)-1 {
+					m.appDetailCursor++
+				}
+				m.updateDetailContent()
+				return m, nil
+			case key.Matches(msg, key.NewBinding(key.WithKeys("k", "up"))):
+				if m.appDetailCursor > 0 {
+					m.appDetailCursor--
+				}
+				m.updateDetailContent()
+				return m, nil
+			case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
+				if cur.IsAddTarget {
+					// Open add-target instance selection modal
+					m.addTargetEnv = cur.EnvName
+					m.addTargetCursor = 0
+					m.addTargetInsts = nil
+					m.addTargetLoading = true
+					m.addTargetStatus = "Loading instances..."
+					m.view = viewAddTarget
+					cmds := []tea.Cmd{applications.FetchInstances(m.ctx, m.client, m.appDetail.Region)}
+					if m.accountID == "" {
+						cmds = append(cmds, applications.FetchAccountID(m.ctx, m.client))
+					}
+					return m, tea.Batch(cmds...)
+				}
+				// Navigate to instance detail
+				m.appDetailFrom = true
+				m.detail = nil
+				m.metrics = nil
+				m.detailName = cur.Target.Name
+				m.detailRegion = cur.Target.Region
+				m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))
+				m.detailVP.KeyMap.HalfPageDown.SetEnabled(false)
+				mr := instances.MetricRanges[m.metricRange]
+				return m, tea.Batch(
+					instances.FetchInstanceDetail(m.ctx, m.client, cur.Target.Name, cur.Target.Region),
+					instances.FetchMetrics(m.ctx, m.client, cur.Target.Name, cur.Target.Region, mr),
+				)
+			case key.Matches(msg, key.NewBinding(key.WithKeys("x"))):
+				if !cur.IsAddTarget && cur.Target.State == "running" {
+					return m, instances.FetchSSHCredentials(m.ctx, m.client, cur.Target.Name, cur.Target.Region)
+				}
+			case key.Matches(msg, key.NewBinding(key.WithKeys("d"))):
+				if !cur.IsAddTarget {
+					m.disassocConfirm = &cur
+					m.view = viewConfirm
+					return m, nil
+				}
+			case key.Matches(msg, key.NewBinding(key.WithKeys("q", "ctrl+c"))):
+				m.cancel()
+				return m, tea.Quit
+			default:
+				var cmd tea.Cmd
+				m.detailVP, cmd = m.detailVP.Update(msg)
+				return m, cmd
+			}
+			return m, nil
+		}
+
+		// Instance detail view (possibly navigated from app detail)
 		state := ""
 		if m.detail != nil && m.detail.State != nil && m.detail.State.Name != nil {
 			state = *m.detail.State.Name
 		}
 		switch {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+			if m.appDetailFrom {
+				// Go back to app detail
+				m.appDetailFrom = false
+				m.detail = nil
+				m.metrics = nil
+				m.detailName = m.appDetail.Name
+				m.detailRegion = m.appDetail.Region
+				m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))
+				bucketName := m.appDetail.Bucket
+				return m, applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, bucketName, m.appDetail.Region)
+			}
 			m.view = viewResources
 			m.detail = nil
 			m.metrics = nil
@@ -540,12 +764,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.view = viewConfirm
 			return m, nil
 		case key.Matches(msg, key.NewBinding(key.WithKeys("d"))):
-			if m.appDetail != nil {
-				m.appConfirmName = name
-				m.appConfirmReg = region
-				m.view = viewConfirm
-				return m, nil
-			}
 			if m.detail == nil {
 				return m, nil
 			}
@@ -593,6 +811,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+		if m.deleteProgress != nil && m.deleteProgress.Failed() {
+			m.deleteProgress = nil
+			return m, nil
+		}
 		m.view = viewResources
 		m.filter = ""
 		m.applyFilter()
@@ -673,6 +895,7 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 		if kind == "lightsail/applications" {
 			m.view = viewDetail
 			m.appDetail = nil
+			m.appDetailCursor = 0
 			m.detailName = r.Name()
 			m.detailRegion = r.Region()
 			m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))
@@ -808,8 +1031,13 @@ func (m Model) handleShellKey() (tea.Model, tea.Cmd) {
 
 func (m *Model) updateDetailContent() {
 	var content string
-	if m.provider().Kind() == "lightsail/applications" {
-		content = applications.RenderAppDetail(m.appDetail, m.width)
+	if m.appDetailFrom || (m.detail != nil && m.appDetail != nil) {
+		// Viewing instance detail (possibly navigated from app detail)
+		content = instances.RenderInstanceDetail(m.detail, m.metrics, m.metricsLoading, m.metricRange, m.width)
+	} else if m.provider().Kind() == "lightsail/applications" && m.appDetail != nil {
+		content = applications.RenderAppDetail(m.appDetail, m.appDetailCursor, m.width)
+	} else if m.provider().Kind() == "lightsail/applications" {
+		content = applications.RenderAppDetail(nil, 0, m.width)
 	} else {
 		content = instances.RenderInstanceDetail(m.detail, m.metrics, m.metricsLoading, m.metricRange, m.width)
 	}
@@ -862,18 +1090,40 @@ func (m Model) View() tea.View {
 		if m.createScreen != nil {
 			screen = utils.Overlay(base, m.createScreen.View(), m.width, m.height)
 		} else if m.appCreateScreen != nil {
-			screen = utils.Overlay(base, m.appCreateScreen.View(), m.width, m.height)
+			screen = utils.Overlay(base, m.appCreateScreen.ViewWithSpinner(m.spinner.View()), m.width, m.height)
 		} else {
 			screen = base
 		}
-	} else if m.view == viewDetail {
+	} else if m.view == viewDetail || m.view == viewAddTarget {
 		help := " esc:back  ↑↓:scroll  pgup/pgdn "
 		if kind == "lightsail/instances" {
 			help = " esc:back  s:stop/start  d:delete  x:shell  [/]:range  ↑↓:scroll  pgup/pgdn "
 		} else if kind == "lightsail/applications" {
-			help = " esc:back  d:delete  ↑↓:scroll  pgup/pgdn "
+			if m.appDetail != nil && m.detail == nil {
+				targets := applications.AppDetailTargets(m.appDetail)
+				if len(targets) > 0 && !targets[m.appDetailCursor].IsAddTarget {
+					help = " esc:back  j/k:select  enter:detail  x:ssh  d:disassociate "
+				} else {
+					help = " esc:back  j/k:select  enter:add/detail  x:ssh "
+				}
+			} else if m.appDetailFrom {
+				help = " esc:app detail  s:stop/start  d:delete  x:shell  [/]:range  ↑↓:scroll "
+			}
 		}
-		screen = utils.RenderWithStatusBar(m.detailVP.View(), help, m.width, m.height)
+		detailScreen := utils.RenderWithStatusBar(m.detailVP.View(), help, m.width, m.height)
+		if m.view == viewAddTarget {
+			modal := applications.RenderInstanceSelectModal(m.addTargetInsts, m.addTargetCursor)
+			if m.addTargetLoading {
+				modal = utils.TitleStyle.Render(fmt.Sprintf(" %s %s ", m.spinner.View(), m.addTargetStatus))
+			}
+			screen = utils.Overlay(detailScreen, modal, m.width, m.height)
+		} else if m.addTargetLoading {
+			// Show progress overlay while adding target
+			modal := utils.TitleStyle.Render(fmt.Sprintf(" %s %s ", m.spinner.View(), m.addTargetStatus))
+			screen = utils.Overlay(detailScreen, modal, m.width, m.height)
+		} else {
+			screen = detailScreen
+		}
 	} else {
 		base := renderBase()
 		switch m.view {
@@ -882,13 +1132,20 @@ func (m Model) View() tea.View {
 		case viewProviders:
 			screen = utils.Overlay(base, instances.RenderProviderModal(m.providers, m.provCursor), m.width, m.height)
 		case viewConfirm:
-			if m.appConfirmName != "" {
-				screen = utils.Overlay(base, applications.RenderAppConfirmModal(m.appConfirmName), m.width, m.height)
+			if m.disassocConfirm != nil {
+				base := utils.RenderWithStatusBar(m.detailVP.View(), "", m.width, m.height)
+				screen = utils.Overlay(base, applications.RenderDisassociateConfirmModal(m.disassocConfirm.Target.Name, m.disassocConfirm.EnvName), m.width, m.height)
+			} else if m.appConfirmName != "" {
+				screen = utils.Overlay(renderBase(), applications.RenderAppConfirmModal(m.appConfirmName), m.width, m.height)
 			} else {
-				screen = utils.Overlay(base, instances.RenderConfirmModal(m.confirm), m.width, m.height)
+				screen = utils.Overlay(renderBase(), instances.RenderConfirmModal(m.confirm), m.width, m.height)
 			}
 		default:
-			screen = base
+			if m.deleteProgress != nil {
+				screen = utils.Overlay(base, m.deleteProgress.View(m.spinner.View(), m.width), m.width, m.height)
+			} else {
+				screen = base
+			}
 		}
 	}
 	if m.toast.Active() {

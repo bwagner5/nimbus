@@ -2,6 +2,7 @@ package resources
 
 import (
 	"context"
+	"strings"
 
 	"github.com/wagnerbm/nimbusv2/internal/applications"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
@@ -16,7 +17,12 @@ func ParseAppName(bucketName string) string {
 }
 
 type LightsailApplication struct {
-	id, name, bucket, region, state string
+	id, name, bucket, region, state, envs string
+}
+
+// NewLightsailApplication creates a LightsailApplication resource.
+func NewLightsailApplication(name, bucket, region, state, envs string) LightsailApplication {
+	return LightsailApplication{id: bucket, name: name, bucket: bucket, region: region, state: state, envs: envs}
 }
 
 func (a LightsailApplication) ID() string     { return a.id }
@@ -24,10 +30,10 @@ func (a LightsailApplication) Name() string   { return a.name }
 func (a LightsailApplication) Status() string { return a.state }
 func (a LightsailApplication) Region() string { return a.region }
 func (a LightsailApplication) Columns() []string {
-	return []string{"NAME", "STATE", "BUCKET", "REGION"}
+	return []string{"NAME", "STATE", "ENVS", "BUCKET", "REGION"}
 }
 func (a LightsailApplication) Values() []string {
-	return []string{a.name, a.state, a.bucket, a.region}
+	return []string{a.name, a.state, a.envs, a.bucket, a.region}
 }
 func (a LightsailApplication) Bucket() string { return a.bucket }
 
@@ -42,7 +48,7 @@ func NewLightsailApplicationProvider(client *aws.Client) *LightsailApplicationPr
 func (p *LightsailApplicationProvider) Kind() string { return "lightsail/applications" }
 
 func (p *LightsailApplicationProvider) Headers() []string {
-	return []string{"NAME", "STATE", "BUCKET", "REGION"}
+	return []string{"NAME", "STATE", "ENVS", "BUCKET", "REGION"}
 }
 
 func (p *LightsailApplicationProvider) Fetch(ctx context.Context, region string) ([]Resource, error) {
@@ -54,11 +60,12 @@ func (p *LightsailApplicationProvider) Fetch(ctx context.Context, region string)
 	var res []Resource
 	for _, a := range apps {
 		res = append(res, LightsailApplication{
-			id:     a.Bucket, // use bucket as ID
+			id:     a.Bucket,
 			name:   a.Name,
 			bucket: a.Bucket,
 			region: a.Region,
 			state:  a.State,
+			envs:   strings.Join(a.Envs, ","),
 		})
 	}
 	return res, nil
