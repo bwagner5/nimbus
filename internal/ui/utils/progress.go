@@ -87,6 +87,17 @@ func (p *StepProgress) CompleteSub(idx, sub int) {
 	}
 }
 
+// FailSub marks a sub-step as failed and also marks the parent step as failed.
+func (p *StepProgress) FailSub(idx, sub int, err error) {
+	if idx >= 0 && idx < len(p.Steps) {
+		p.Steps[idx].State = StepFailed
+		if sub >= 0 && sub < len(p.Steps[idx].SubSteps) {
+			p.Steps[idx].SubSteps[sub].State = StepFailed
+			p.Steps[idx].SubSteps[sub].Err = err
+		}
+	}
+}
+
 // Done returns true if all steps are done.
 func (p *StepProgress) Done() bool {
 	for _, s := range p.Steps {
@@ -107,11 +118,18 @@ func (p *StepProgress) Failed() bool {
 	return false
 }
 
-// Error returns the first error from a failed step.
+// Error returns the first error from a failed step or sub-step.
 func (p *StepProgress) Error() error {
 	for _, s := range p.Steps {
-		if s.State == StepFailed && s.Err != nil {
-			return s.Err
+		if s.State == StepFailed {
+			if s.Err != nil {
+				return s.Err
+			}
+			for _, sub := range s.SubSteps {
+				if sub.State == StepFailed && sub.Err != nil {
+					return sub.Err
+				}
+			}
 		}
 	}
 	return nil

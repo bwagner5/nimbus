@@ -349,6 +349,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case applications.CreateAppMsg:
+		m.trace.Log("msg=CreateAppMsg err=%v", msg.Err)
 		if m.appCreateScreen != nil {
 			m.appCreateScreen, _ = m.appCreateScreen.Update(msg)
 			if m.appCreateScreen.IsComplete() {
@@ -388,7 +389,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.updateDetailContent()
 
-	case applications.DeleteTagsDoneMsg:
+	case applications.CleanupInstancesDoneMsg:
 		if m.deleteProgress != nil {
 			if msg.Err != nil {
 				m.deleteProgress.Fail(0, msg.Err)
@@ -396,16 +397,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.deleteProgress.Complete(0)
 			m.deleteProgress.Start(1)
-			return m, applications.DeleteAppBuckets(m.ctx, m.client, m.deleteAppName, m.deleteAppReg)
+			return m, applications.DeleteAppTags(m.ctx, m.client, m.deleteAppName, m.deleteAppReg)
 		}
 
-	case applications.DeleteAppMsg:
+	case applications.DeleteTagsDoneMsg:
 		if m.deleteProgress != nil {
 			if msg.Err != nil {
 				m.deleteProgress.Fail(1, msg.Err)
 				return m, nil
 			}
 			m.deleteProgress.Complete(1)
+			m.deleteProgress.Start(2)
+			return m, applications.DeleteAppBuckets(m.ctx, m.client, m.deleteAppName, m.deleteAppReg)
+		}
+
+	case applications.DeleteAppMsg:
+		if m.deleteProgress != nil {
+			if msg.Err != nil {
+				m.deleteProgress.Fail(2, msg.Err)
+				return m, nil
+			}
+			m.deleteProgress.Complete(2)
 		}
 		m.progress = ""
 		if msg.Err != nil {
@@ -415,8 +427,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.deletedApps == nil {
 			m.deletedApps = make(map[string]time.Time)
 		}
-		m.deletedApps[msg.Name] = time.Now().Add(15 * time.Second)
+		m.deletedApps[msg.Name] = time.Now().Add(60 * time.Second)
 		m.applyFilter()
+		m.refreshGen++
 		// Auto-dismiss after a short delay
 		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return deleteProgressDoneMsg{} })
 
@@ -467,8 +480,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		if m.appCreateScreen != nil {
+			m.trace.Log("msg=appCreateForward type=%T", msg)
+			bucketWasCreated := m.appCreateScreen.BucketCreated()
 			var cmd tea.Cmd
 			m.appCreateScreen, cmd = m.appCreateScreen.Update(msg)
+			if m.appCreateScreen.IsComplete() {
+				m.trace.Log("msg=appCreateComplete")
+				return m, tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg { return appCreateDoneMsg{} })
+			}
+			if m.appCreateScreen.Progress() != nil && m.appCreateScreen.Progress().Failed() {
+				m.trace.Log("msg=appCreateFailed err=%v", m.appCreateScreen.Progress().Error())
+			}
+			// Trigger a background refresh the moment the bucket is created
+			if !bucketWasCreated && m.appCreateScreen.BucketCreated() {
+				m.refreshGen++
+				return m, tea.Batch(cmd, instances.FetchResources(m.ctx, m.client, m.provider(), m.region))
+			}
 			return m, cmd
 		}
 	}
@@ -539,8 +566,16 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.appCreateScreen, cmd = m.appCreateScreen.Update(msg)
 		if m.appCreateScreen.IsCancelled() || m.appCreateScreen.IsComplete() {
+			bucketCreated := m.appCreateScreen.BucketCreated()
 			m.view = viewResources
 			m.appCreateScreen = nil
+			if bucketCreated {
+				m.refreshGen++
+				return m, tea.Batch(
+					instances.FetchResources(m.ctx, m.client, m.provider(), m.region),
+					instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
+				)
+			}
 			return m, nil
 		}
 		return m, cmd
@@ -569,12 +604,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.deleteAppReg = region
 			m.deleteProgress = utils.NewStepProgress(
 				fmt.Sprintf("Deleting %s", name),
-				"Remove instance tags",
-				"Delete environment buckets",
+				appsdk.DeleteSteps(name)...,
 			)
 			m.deleteProgress.Start(0)
+			m.refreshGen++
 			m.view = viewResources
-			return m, applications.DeleteAppTags(m.ctx, m.client, name, region)
+			return m, applications.CleanupAppInstances(m.ctx, m.client, name, region)
 		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
 			m.appConfirmName = ""
 			m.view = viewResources
@@ -633,7 +668,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		region := m.detailRegion
 
 		// App detail view: target selection with j/k, enter, x, d
-		if m.appDetail != nil {
+		if m.appDetail != nil && !m.appDetailFrom {
 			targets := applications.AppDetailTargets(m.appDetail)
 			cur := targets[m.appDetailCursor]
 			switch {
@@ -714,6 +749,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.appDetailFrom = false
 				m.detail = nil
 				m.metrics = nil
+				if m.appDetail == nil {
+					m.view = viewResources
+					return m, nil
+				}
 				m.detailName = m.appDetail.Name
 				m.detailRegion = m.appDetail.Region
 				m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))

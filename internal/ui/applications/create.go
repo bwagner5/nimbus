@@ -31,8 +31,9 @@ type CreateScreen struct {
 	envName string
 	target  string
 	// intermediate state for chained target steps
-	targetKeyID  string
-	targetSecret string
+	targetKeyID    string
+	targetSecret   string
+	bucketCreated  bool
 }
 
 // InstancesMsg carries available instances for target selection.
@@ -49,6 +50,9 @@ type createKeyDoneMsg struct {
 	KeyID  string
 	Secret string
 }
+type writeCredsDoneMsg struct{ Err error }
+type uploadBinaryDoneMsg struct{ Err error }
+type installWatchDoneMsg struct{ Err error }
 
 func NewCreateScreen(client *aws.Client, region string, ctx context.Context) *CreateScreen {
 	return &CreateScreen{client: client, region: region, ctx: ctx}
@@ -128,6 +132,7 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 			s.creating = false
 			return s, nil
 		}
+		s.bucketCreated = true
 		s.progress.Complete(0)
 		if s.target != "" && s.target != "skip" {
 			s.progress.Start(1)
@@ -141,7 +146,7 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 	// Sub-step: tag target
 	case tagTargetDoneMsg:
 		if msg.Err != nil {
-			s.progress.Fail(1, msg.Err)
+			s.progress.FailSub(1, 0, msg.Err)
 			s.creating = false
 			return s, nil
 		}
@@ -152,7 +157,7 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 	// Sub-step: create access key
 	case createKeyDoneMsg:
 		if msg.Err != nil {
-			s.progress.Fail(1, msg.Err)
+			s.progress.FailSub(1, 1, msg.Err)
 			s.creating = false
 			return s, nil
 		}
@@ -162,25 +167,38 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 		s.progress.StartSub(1, 2)
 		return s, s.doWriteCreds()
 
-	// Final: add target complete
-	case CreateAppMsg:
-		s.creating = false
+	// Sub-step: write credentials
+	case writeCredsDoneMsg:
 		if msg.Err != nil {
-			if s.progress != nil {
-				for i := range s.progress.Steps {
-					if s.progress.Steps[i].State == utils.StepRunning {
-						s.progress.Fail(i, msg.Err)
-						break
-					}
-				}
-			}
+			s.progress.FailSub(1, 2, msg.Err)
+			s.creating = false
 			return s, nil
 		}
-		if s.progress != nil {
-			s.progress.CompleteSub(1, 2)
-			s.progress.Complete(1)
+		s.progress.CompleteSub(1, 2)
+		s.progress.StartSub(1, 3)
+		return s, s.doUploadBinary()
+
+	// Sub-step: upload binary
+	case uploadBinaryDoneMsg:
+		if msg.Err != nil {
+			s.progress.FailSub(1, 3, msg.Err)
+			s.creating = false
+			return s, nil
 		}
-		s.result = &msg
+		s.progress.CompleteSub(1, 3)
+		s.progress.StartSub(1, 4)
+		return s, s.doInstallWatch()
+
+	// Sub-step: install watch service
+	case installWatchDoneMsg:
+		s.creating = false
+		if msg.Err != nil {
+			s.progress.FailSub(1, 4, msg.Err)
+			return s, nil
+		}
+		s.progress.CompleteSub(1, 4)
+		s.progress.Complete(1)
+		s.result = &CreateAppMsg{Name: s.appName}
 		return s, nil
 	}
 
@@ -208,13 +226,14 @@ func (s *CreateScreen) startCreate() tea.Cmd {
 	s.envName = vals["env"]
 	s.target = vals["target"]
 
-	labels := []string{fmt.Sprintf("Create bucket for %s/%s", s.appName, s.envName)}
-	if s.target != "" && s.target != "skip" {
-		labels = append(labels, fmt.Sprintf("Add target %s", s.target))
+	target := s.target
+	if target == "skip" {
+		target = ""
 	}
+	labels, targetSubs := applications.CreateSteps(s.appName, s.envName, target)
 	s.progress = utils.NewStepProgress("Creating Application", labels...)
-	if s.target != "" && s.target != "skip" {
-		s.progress.SetSubSteps(1, "Tag instance", "Create access key", "Write credentials to instance")
+	if len(targetSubs) > 0 {
+		s.progress.SetSubSteps(1, targetSubs...)
 	}
 	s.progress.Start(0)
 
@@ -255,10 +274,23 @@ func (s *CreateScreen) doWriteCreds() tea.Cmd {
 	bucketName := applications.BucketName(accountID, appName, envName)
 	return func() tea.Msg {
 		err := applications.NewClient(client).WriteTargetCredentials(ctx, target, appName, envName, keyID, secret, bucketName, region)
-		if err != nil {
-			return CreateAppMsg{Err: err, Name: appName}
-		}
-		return CreateAppMsg{Name: appName}
+		return writeCredsDoneMsg{Err: err}
+	}
+}
+
+func (s *CreateScreen) doUploadBinary() tea.Cmd {
+	client, target, region, ctx := s.client, s.target, s.region, s.ctx
+	return func() tea.Msg {
+		err := applications.NewClient(client).UploadBinary(ctx, target, region)
+		return uploadBinaryDoneMsg{Err: err}
+	}
+}
+
+func (s *CreateScreen) doInstallWatch() tea.Cmd {
+	client, target, appName, envName, region, ctx := s.client, s.target, s.appName, s.envName, s.region, s.ctx
+	return func() tea.Msg {
+		err := applications.NewClient(client).InstallWatch(ctx, target, appName, envName, region)
+		return installWatchDoneMsg{Err: err}
 	}
 }
 
@@ -266,6 +298,7 @@ func (s *CreateScreen) IsCancelled() bool {
 	return s.wizard != nil && s.wizard.IsCancelled()
 }
 func (s *CreateScreen) IsComplete() bool { return s.result != nil && s.result.Err == nil }
+func (s *CreateScreen) BucketCreated() bool { return s.bucketCreated }
 func (s *CreateScreen) Errors() []string { return s.errors }
 func (s *CreateScreen) ClearErrors()     { s.errors = nil }
 

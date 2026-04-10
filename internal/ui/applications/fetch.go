@@ -106,7 +106,21 @@ type DeleteTagsDoneMsg struct {
 	Name string
 }
 
-// DeleteAppTags removes instance tags (step 1 of delete).
+// CleanupInstancesDoneMsg signals instance cleanup step completed.
+type CleanupInstancesDoneMsg struct {
+	Err  error
+	Name string
+}
+
+// CleanupAppInstances cleans up instances (step 1 of delete).
+func CleanupAppInstances(ctx context.Context, client *aws.Client, appName, region string) tea.Cmd {
+	return func() tea.Msg {
+		err := applications.NewClient(client).CleanupInstances(ctx, appName, region)
+		return CleanupInstancesDoneMsg{Err: err, Name: appName}
+	}
+}
+
+// DeleteAppTags removes instance tags (step 2 of delete).
 func DeleteAppTags(ctx context.Context, client *aws.Client, appName, region string) tea.Cmd {
 	return func() tea.Msg {
 		err := applications.NewClient(client).DeleteTags(ctx, appName, region)

@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	BucketPrefix = "ls-app-"
+	BucketPrefix = "nimbus--"
 	TagPrefix    = "nimbus:app:"
 )
 
@@ -106,27 +106,27 @@ func (c *Client) AccountID(ctx context.Context) (string, error) {
 	return *out.Account, nil
 }
 
-// BucketName returns the bucket name for an app-env: ls-app-<account>-<app>-<env>.
+// BucketName returns the bucket name for an app-env: nimbus--<account>--<app>--<env>.
 func BucketName(accountID, appName, envName string) string {
-	return fmt.Sprintf("%s%s-%s-%s", BucketPrefix, accountID, appName, envName)
+	return fmt.Sprintf("%s%s--%s--%s", BucketPrefix, accountID, appName, envName)
 }
 
 // ParseAppName extracts just the app name from a bucket name.
-// For ls-app-<account>-<app>-<env> it returns <app>.
+// ParseAppName extracts just the app name from a bucket name.
 func ParseAppName(bucketName string) string {
 	app, _ := ParseAppEnv(bucketName)
 	return app
 }
 
-// ParseAppEnv extracts app name and env from a bucket name like ls-app-<account>-<app>-<env>.
+// ParseAppEnv extracts app name and env from a bucket name like nimbus--<account>--<app>--<env>.
 func ParseAppEnv(bucketName string) (appName, envName string) {
 	if !strings.HasPrefix(bucketName, BucketPrefix) {
 		return "", ""
 	}
 	rest := strings.TrimPrefix(bucketName, BucketPrefix)
-	// rest = "<account>-<app>-<env>"
-	parts := strings.SplitN(rest, "-", 3)
-	if len(parts) < 3 {
+	// rest = "<account>--<app>--<env>"
+	parts := strings.SplitN(rest, "--", 3)
+	if len(parts) != 3 || parts[1] == "" || parts[2] == "" {
 		return "", ""
 	}
 	return parts[1], parts[2]
@@ -311,6 +311,26 @@ func (c *Client) Delete(ctx context.Context, appName, region string) error {
 	return c.DeleteBuckets(ctx, appName, region)
 }
 
+// CleanupInstances SSHes to each tagged instance for the app and runs uninstall-watch.
+func (c *Client) CleanupInstances(ctx context.Context, appName, region string) error {
+	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
+	prefix := TagPrefix + appName + ":"
+	c.forEachInstance(ctx, svc, func(inst lstypes.Instance) {
+		for _, tag := range inst.Tags {
+			if tag.Key == nil || !strings.HasPrefix(*tag.Key, prefix) {
+				continue
+			}
+			envName := strings.TrimPrefix(*tag.Key, prefix)
+			if envName == "" || inst.Name == nil {
+				continue
+			}
+			c.UninstallWatch(ctx, *inst.Name, appName, envName, region) // best-effort
+			break // one cleanup per instance
+		}
+	})
+	return nil
+}
+
 // DeleteTags removes all instance tags for the app.
 func (c *Client) DeleteTags(ctx context.Context, appName, region string) error {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
@@ -357,7 +377,7 @@ func (c *Client) DeleteBuckets(ctx context.Context, appName, region string) erro
 }
 
 // AddTarget tags an instance as a deployment target for an app/env, creates a
-// bucket access key, and writes credentials to the instance via SSH.
+// bucket access key, writes credentials, uploads the binary, and installs the watch service.
 func (c *Client) AddTarget(ctx context.Context, instanceName, appName, envName, accountID, region string) error {
 	if err := c.TagTarget(ctx, instanceName, appName, envName, region); err != nil {
 		return err
@@ -366,7 +386,13 @@ func (c *Client) AddTarget(ctx context.Context, instanceName, appName, envName, 
 	if err != nil {
 		return err
 	}
-	return c.WriteTargetCredentials(ctx, instanceName, appName, envName, keyID, secret, BucketName(accountID, appName, envName), region)
+	if err := c.WriteTargetCredentials(ctx, instanceName, appName, envName, keyID, secret, BucketName(accountID, appName, envName), region); err != nil {
+		return err
+	}
+	if err := c.UploadBinary(ctx, instanceName, region); err != nil {
+		return err
+	}
+	return c.InstallWatch(ctx, instanceName, appName, envName, region)
 }
 
 // TagTarget tags an instance as a deployment target for an app/env.
@@ -396,7 +422,6 @@ func (c *Client) WriteTargetCredentials(ctx context.Context, instanceName, appNa
 	defer os.Remove(creds.KeyPath)
 	defer os.Remove(creds.KeyPath + "-cert.pub")
 
-	// Write .credentials and .bucket to the instance
 	remoteDir := fmt.Sprintf("/opt/nimbus/%s/%s", appName, envName)
 	credContent := fmt.Sprintf("AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_DEFAULT_REGION=%s\n", keyID, secret, region)
 	remoteCmd := fmt.Sprintf(
@@ -405,12 +430,91 @@ func (c *Client) WriteTargetCredentials(ctx context.Context, instanceName, appNa
 	)
 
 	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
-	sshOpts := []string{"-i", creds.KeyPath, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"}
-	cmd := exec.Command("ssh", append(sshOpts, sshTarget, remoteCmd)...)
+	sshOpts := sshOptions(creds.KeyPath)
+	cmd := exec.CommandContext(ctx, "ssh", append(sshOpts, sshTarget, remoteCmd)...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("write credentials to instance: %s: %w", strings.TrimSpace(string(output)), err)
 	}
+	return nil
+}
 
+// UploadBinary SCPs the nimbus binary from dist/ to the instance, if it exists.
+func (c *Client) UploadBinary(ctx context.Context, instanceName, region string) error {
+	if _, err := os.Stat("dist/nimbus"); err != nil {
+		return nil // no binary to upload, skip
+	}
+	creds, err := c.GetSSHCredentials(ctx, instanceName, region)
+	if err != nil {
+		return fmt.Errorf("get SSH credentials: %w", err)
+	}
+	defer os.Remove(creds.KeyPath)
+	defer os.Remove(creds.KeyPath + "-cert.pub")
+
+	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
+	sshOpts := sshOptions(creds.KeyPath)
+	scpCmd := exec.CommandContext(ctx, "scp", append(sshOpts, "dist/nimbus", sshTarget+":/tmp/nimbus")...)
+	if output, err := scpCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("scp nimbus binary: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+	mvCmd := exec.CommandContext(ctx, "ssh", append(sshOpts, sshTarget, "sudo mv /tmp/nimbus /usr/local/bin/nimbus && sudo chmod +x /usr/local/bin/nimbus")...)
+	if output, err := mvCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("install nimbus binary: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+	return nil
+}
+
+// sshOptions returns common SSH/SCP options with timeouts.
+func sshOptions(keyPath string) []string {
+	return []string{"-i", keyPath, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"}
+}
+
+// sshTimeout returns a context with a 5-minute timeout for SSH operations.
+func sshTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, 5*time.Minute)
+}
+
+// InstallWatch SSHes to the instance and runs nimbus app install-watch.
+func (c *Client) InstallWatch(ctx context.Context, instanceName, appName, envName, region string) error {
+	ctx, cancel := sshTimeout(ctx)
+	defer cancel()
+
+	creds, err := c.GetSSHCredentials(ctx, instanceName, region)
+	if err != nil {
+		return fmt.Errorf("get SSH credentials: %w", err)
+	}
+	defer os.Remove(creds.KeyPath)
+	defer os.Remove(creds.KeyPath + "-cert.pub")
+
+	remoteCmd := fmt.Sprintf("sudo /usr/local/bin/nimbus app install-watch --name %s --env %s", appName, envName)
+	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
+	cmd := exec.CommandContext(ctx, "ssh", append(sshOptions(creds.KeyPath), sshTarget, remoteCmd)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("install-watch timed out after 5m: %w", ctx.Err())
+		}
+		return fmt.Errorf("install-watch: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+	return nil
+}
+
+// UninstallWatch SSHes to the instance and runs nimbus app uninstall-watch.
+func (c *Client) UninstallWatch(ctx context.Context, instanceName, appName, envName, region string) error {
+	ctx, cancel := sshTimeout(ctx)
+	defer cancel()
+
+	creds, err := c.GetSSHCredentials(ctx, instanceName, region)
+	if err != nil {
+		return fmt.Errorf("get SSH credentials: %w", err)
+	}
+	defer os.Remove(creds.KeyPath)
+	defer os.Remove(creds.KeyPath + "-cert.pub")
+
+	remoteCmd := fmt.Sprintf("sudo /usr/local/bin/nimbus app uninstall-watch --name %s --env %s", appName, envName)
+	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
+	cmd := exec.CommandContext(ctx, "ssh", append(sshOptions(creds.KeyPath), sshTarget, remoteCmd)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("uninstall-watch: %s: %w", strings.TrimSpace(string(output)), err)
+	}
 	return nil
 }
 
@@ -431,29 +535,7 @@ func (c *Client) RemoveTarget(ctx context.Context, instanceName, appName, envNam
 		return nil
 	}
 
-	// SSH to instance and clean up
-	creds, err := c.GetSSHCredentials(ctx, instanceName, region)
-	if err != nil {
-		return nil // tag removed, cleanup is best-effort
-	}
-	defer os.Remove(creds.KeyPath)
-	defer os.Remove(creds.KeyPath + "-cert.pub")
-
-	svcName := fmt.Sprintf("nimbus-watch-%s-%s", appName, envName)
-	envDir := fmt.Sprintf("/opt/nimbus/%s/%s", appName, envName)
-	appDir := fmt.Sprintf("/opt/nimbus/%s", appName)
-
-	// Stop service, remove unit, remove env dir, remove app dir if empty
-	remoteCmd := fmt.Sprintf(
-		"sudo systemctl stop %s 2>/dev/null; sudo systemctl disable %s 2>/dev/null; sudo rm -f /etc/systemd/system/%s.service; sudo systemctl daemon-reload; sudo rm -rf %s; sudo rmdir %s 2>/dev/null; true",
-		svcName, svcName, svcName, envDir, appDir,
-	)
-
-	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
-	sshOpts := []string{"-i", creds.KeyPath, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"}
-	cmd := exec.Command("ssh", append(sshOpts, sshTarget, remoteCmd)...)
-	cmd.CombinedOutput() // best-effort
-
+	c.UninstallWatch(ctx, instanceName, appName, envName, region) // best-effort
 	return nil
 }
 
@@ -552,8 +634,7 @@ func InstallWatchService(appName, envName string) error {
 
 	unit := fmt.Sprintf(`[Unit]
 Description=Nimbus deployment watcher for %s/%s
-After=network.target docker.service
-Requires=docker.service
+After=network.target
 
 [Service]
 Type=simple
@@ -585,6 +666,18 @@ func runSystemctl(args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// UninstallWatchService stops and removes the systemd watch service for an app/env.
+// Intended to run on the instance itself.
+func UninstallWatchService(appName, envName string) error {
+	svcName := fmt.Sprintf("nimbus-watch-%s-%s", appName, envName)
+	path := fmt.Sprintf("/etc/systemd/system/%s.service", svcName)
+	// Best-effort stop and disable
+	runSystemctl("stop", svcName)
+	runSystemctl("disable", svcName)
+	os.Remove(path)
+	return runSystemctl("daemon-reload")
 }
 
 // forEachInstance iterates over all instances, handling pagination.

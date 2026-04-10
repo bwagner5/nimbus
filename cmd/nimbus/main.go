@@ -101,6 +101,8 @@ Commands:
   application delete          Delete an application
   application watch           Watch for new deployments (runs on instance)
   application install-watch   Install systemd watch service on instance
+  application uninstall-watch Uninstall systemd watch service on instance
+  application local list      List app environments on this instance
   application disassociate    Remove an instance as a deployment target
 
 Flags:
@@ -139,6 +141,8 @@ Commands:
   delete          Delete an application
   watch           Watch for new deployments (runs on instance)
   install-watch   Install systemd watch service on instance
+  uninstall-watch Uninstall systemd watch service on instance
+  local           Commands to run on a deployment target instance
   disassociate    Remove an instance as a deployment target
 `)
 		os.Exit(1)
@@ -155,6 +159,10 @@ Commands:
 		handleWatch(args[1:])
 	case "install-watch":
 		handleInstallWatch(args[1:])
+	case "uninstall-watch":
+		handleUninstallWatch(args[1:])
+	case "local":
+		handleLocal(args[1:])
 	case "disassociate":
 		handleDisassociate(args[1:])
 	default:
@@ -298,6 +306,54 @@ func handleInstallWatch(args []string) {
 		fatal(err)
 	}
 	fmt.Printf("✅ Installed and started nimbus-watch-%s-%s.service\n", *name, *env)
+}
+
+func handleLocal(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: nimbus application local <command>\n\nCommands:\n  list  List app environments on this instance\n")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "list", "ls":
+		handleLocalList()
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown command: nimbus application local %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func handleLocalList() {
+	envs, err := applications.LocalList()
+	if err != nil {
+		fatal(err)
+	}
+	if len(envs) == 0 {
+		fmt.Println("No application environments found in /opt/nimbus")
+		return
+	}
+	fmt.Printf("%-20s %-12s %-14s %s\n", "APP", "ENV", "STATUS", "UNIT")
+	for _, e := range envs {
+		fmt.Printf("%-20s %-12s %-14s %s\n", e.App, e.Env, e.Status, e.Unit)
+	}
+}
+
+func handleUninstallWatch(args []string) {
+	fs := flag.NewFlagSet("nimbus application uninstall-watch", flag.ExitOnError)
+	name := fs.String("name", "", "Application name (required)")
+	env := fs.String("env", "dev", "Environment name")
+	fs.Parse(args)
+
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "Error: --name is required")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	fmt.Printf("Uninstalling watch service for %s/%s...\n", *name, *env)
+	if err := applications.UninstallWatchService(*name, *env); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("✅ Uninstalled nimbus-watch-%s-%s.service\n", *name, *env)
 }
 
 func handleDisassociate(args []string) {
