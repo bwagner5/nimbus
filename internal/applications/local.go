@@ -76,3 +76,20 @@ func serviceStatus(unit string) string {
 	}
 	return state
 }
+
+// LocalRemove removes the env directory for an app/env and the app directory if empty.
+func LocalRemove(appName, envName string) error {
+	envDir := fmt.Sprintf("/opt/nimbus/%s/%s", appName, envName)
+	if err := os.RemoveAll(envDir); err != nil {
+		return fmt.Errorf("remove %s: %w", envDir, err)
+	}
+	appDir := fmt.Sprintf("/opt/nimbus/%s", appName)
+	entries, err := os.ReadDir(appDir)
+	if err != nil {
+		return nil // already gone
+	}
+	if len(entries) == 0 {
+		os.Remove(appDir)
+	}
+	return nil
+}

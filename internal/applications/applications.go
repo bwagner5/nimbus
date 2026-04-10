@@ -254,6 +254,37 @@ func (c *Client) GetDetail(ctx context.Context, appName, bucketName, region stri
 }
 
 // fetchEnvStatuses downloads *_status.json files from a bucket and attaches to matching targets.
+// FetchBucketStatuses reads all *_status.json files from a bucket and returns them.
+func (c *Client) FetchBucketStatuses(ctx context.Context, bucketName, region string) ([]InstanceStatus, error) {
+	s3svc := s3.NewFromConfig(c.aws.WithRegion(region).Config())
+	listOut, err := s3svc.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: &bucketName,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var statuses []InstanceStatus
+	for _, obj := range listOut.Contents {
+		if obj.Key == nil || !strings.HasSuffix(*obj.Key, "_status.json") {
+			continue
+		}
+		getOut, err := s3svc.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucketName, Key: obj.Key})
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(getOut.Body)
+		getOut.Body.Close()
+		if err != nil {
+			continue
+		}
+		var status InstanceStatus
+		if json.Unmarshal(data, &status) == nil {
+			statuses = append(statuses, status)
+		}
+	}
+	return statuses, nil
+}
+
 func (c *Client) fetchEnvStatuses(ctx context.Context, s3svc *s3.Client, env *Environment) {
 	listOut, err := s3svc.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: &env.Bucket,
@@ -325,7 +356,7 @@ func (c *Client) CleanupInstances(ctx context.Context, appName, region string) e
 				continue
 			}
 			c.UninstallWatch(ctx, *inst.Name, appName, envName, region) // best-effort
-			break // one cleanup per instance
+			c.RemoveLocal(ctx, *inst.Name, appName, envName, region)   // best-effort
 		}
 	})
 	return nil
@@ -425,8 +456,8 @@ func (c *Client) WriteTargetCredentials(ctx context.Context, instanceName, appNa
 	remoteDir := fmt.Sprintf("/opt/nimbus/%s/%s", appName, envName)
 	credContent := fmt.Sprintf("AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_DEFAULT_REGION=%s\n", keyID, secret, region)
 	remoteCmd := fmt.Sprintf(
-		"sudo mkdir -p %s && echo '%s' | sudo tee %s/.credentials > /dev/null && sudo chmod 600 %s/.credentials && echo '%s' | sudo tee %s/.bucket > /dev/null",
-		remoteDir, credContent, remoteDir, remoteDir, bucketName, remoteDir,
+		"sudo mkdir -p %s && echo '%s' | sudo tee %s/.credentials > /dev/null && sudo chmod 600 %s/.credentials && echo '%s' | sudo tee %s/.bucket > /dev/null && echo '%s' | sudo tee %s/.instance > /dev/null",
+		remoteDir, credContent, remoteDir, remoteDir, bucketName, remoteDir, instanceName, remoteDir,
 	)
 
 	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
@@ -518,6 +549,30 @@ func (c *Client) UninstallWatch(ctx context.Context, instanceName, appName, envN
 	return nil
 }
 
+// RemoveLocal SSHes to the instance and runs nimbus app local rm.
+func (c *Client) RemoveLocal(ctx context.Context, instanceName, appName, envName, region string) error {
+	ctx, cancel := sshTimeout(ctx)
+	defer cancel()
+
+	creds, err := c.GetSSHCredentials(ctx, instanceName, region)
+	if err != nil {
+		return fmt.Errorf("get SSH credentials: %w", err)
+	}
+	defer os.Remove(creds.KeyPath)
+	defer os.Remove(creds.KeyPath + "-cert.pub")
+
+	remoteCmd := fmt.Sprintf("sudo /usr/local/bin/nimbus app local rm --name %s --env %s", appName, envName)
+	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
+	cmd := exec.CommandContext(ctx, "ssh", append(sshOptions(creds.KeyPath), sshTarget, remoteCmd)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("local rm timed out after 5m: %w", ctx.Err())
+		}
+		return fmt.Errorf("local rm: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+	return nil
+}
+
 // RemoveTarget removes an instance's association tag for an app/env.
 // If cleanup is true, it SSHes to the instance to stop the watch service and remove deploy dirs.
 func (c *Client) RemoveTarget(ctx context.Context, instanceName, appName, envName, region string, cleanup bool) error {
@@ -536,6 +591,7 @@ func (c *Client) RemoveTarget(ctx context.Context, instanceName, appName, envNam
 	}
 
 	c.UninstallWatch(ctx, instanceName, appName, envName, region) // best-effort
+	c.RemoveLocal(ctx, instanceName, appName, envName, region)   // best-effort
 	return nil
 }
 
@@ -597,6 +653,7 @@ func (c *Client) GetSSHCredentials(ctx context.Context, instanceName, region str
 	if err != nil {
 		return nil, fmt.Errorf("get SSH access: %w", err)
 	}
+
 	d := out.AccessDetails
 
 	keyFile, err := os.CreateTemp("", "nimbus-ssh-*")
@@ -711,3 +768,53 @@ func instanceToTarget(inst lstypes.Instance, region string) Target {
 }
 
 func strPtr(s string) *string { return &s }
+
+// OpenFirewallPorts ensures the given TCP ports are open on the instance's Lightsail firewall.
+func (c *Client) OpenFirewallPorts(ctx context.Context, instanceName, region string, ports []int) error {
+	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
+
+	inst, err := svc.GetInstance(ctx, &lightsail.GetInstanceInput{InstanceName: &instanceName})
+	if err != nil {
+		return fmt.Errorf("get instance: %w", err)
+	}
+
+	existing := inst.Instance.Networking.Ports
+	have := map[int32]bool{}
+	var rules []lstypes.PortInfo
+	for _, p := range existing {
+		rules = append(rules, lstypes.PortInfo{
+			FromPort: p.FromPort,
+			ToPort:   p.ToPort,
+			Protocol: p.Protocol,
+			Cidrs:    p.Cidrs,
+		})
+		if p.Protocol == lstypes.NetworkProtocolTcp && p.FromPort == p.ToPort {
+			have[p.FromPort] = true
+		}
+	}
+
+	added := 0
+	for _, port := range ports {
+		p := int32(port)
+		if have[p] {
+			continue
+		}
+		rules = append(rules, lstypes.PortInfo{
+			FromPort: p,
+			ToPort:   p,
+			Protocol: lstypes.NetworkProtocolTcp,
+			Cidrs:    []string{"0.0.0.0/0"},
+		})
+		added++
+	}
+
+	if added == 0 {
+		return nil
+	}
+
+	_, err = svc.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
+		InstanceName: &instanceName,
+		PortInfos:    rules,
+	})
+	return err
+}

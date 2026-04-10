@@ -20,13 +20,15 @@ var (
 	ModalStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("62")).Padding(1, 2).Background(lipgloss.Color("236"))
 	DimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	FilterStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	ToastStyle     = lipgloss.NewStyle().Background(lipgloss.Color("52")).Foreground(lipgloss.Color("255")).Padding(0, 2).Bold(true)
+	ToastStyle        = lipgloss.NewStyle().Background(lipgloss.Color("52")).Foreground(lipgloss.Color("255")).Padding(0, 2).Bold(true)
+	ToastSuccessStyle = lipgloss.NewStyle().Background(lipgloss.Color("22")).Foreground(lipgloss.Color("255")).Padding(0, 2).Bold(true)
 )
 
 // Toast represents a dismissable error banner.
 type Toast struct {
 	messages []string
 	expireAt time.Time
+	isError  bool
 }
 
 type ToastExpireMsg struct{}
@@ -34,7 +36,11 @@ type ToastExpireMsg struct{}
 const ToastDuration = 5 * time.Second
 
 func NewToast(msgs []string) Toast {
-	return Toast{messages: msgs, expireAt: time.Now().Add(ToastDuration)}
+	return Toast{messages: msgs, expireAt: time.Now().Add(ToastDuration), isError: true}
+}
+
+func NewSuccessToast(msgs []string) Toast {
+	return Toast{messages: msgs, expireAt: time.Now().Add(ToastDuration), isError: false}
 }
 
 func (t Toast) Active() bool {
@@ -45,13 +51,18 @@ func (t Toast) View(width int) string {
 	if !t.Active() {
 		return ""
 	}
-	text := " ⚠ " + strings.Join(t.messages, " │ ")
-	// Truncate to fit width (accounting for padding)
+	icon := " ✓ "
+	style := ToastSuccessStyle
+	if t.isError {
+		icon = " ⚠ "
+		style = ToastStyle
+	}
+	text := icon + strings.Join(t.messages, " │ ")
 	maxLen := width - 4
 	if maxLen > 0 && len(text) > maxLen {
 		text = text[:maxLen-1] + "…"
 	}
-	return ToastStyle.Width(width).Render(text)
+	return style.Width(width).Render(text)
 }
 
 func ScheduleToastExpiry() tea.Cmd {

@@ -139,9 +139,9 @@ func (s *CreateScreen) Update(msg tea.Msg) (*CreateScreen, tea.Cmd) {
 			s.progress.StartSub(1, 0)
 			return s, s.doTagTarget()
 		}
-		// No target — signal completion via message
-		appName := s.appName
-		return s, func() tea.Msg { return CreateAppMsg{Name: appName} }
+		// No target — done
+		s.result = &CreateAppMsg{Name: s.appName}
+		return s, nil
 
 	// Sub-step: tag target
 	case tagTargetDoneMsg:

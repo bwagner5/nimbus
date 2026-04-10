@@ -2,7 +2,9 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 
 type appCreateDoneMsg struct{}
 type deleteProgressDoneMsg struct{}
+type disassocDoneMsg struct{}
 type view int
 
 const (
@@ -79,7 +82,8 @@ type Model struct {
 	appDetailFrom   bool // true when viewing instance detail navigated from app detail
 	appConfirmName  string
 	appConfirmReg   string
-	disassocConfirm *applications.TargetEntry // pending disassociate confirmation
+	disassocConfirm  *applications.TargetEntry // pending disassociate confirmation
+	disassocProgress *utils.StepProgress      // step progress for disassociation
 	addTargetEnv     string                   // env name for add-target modal
 	addTargetInsts   []appsdk.Target          // instances available in add-target modal
 	addTargetCursor  int
@@ -283,7 +287,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			m.toast = utils.NewToast([]string{msg.Err.Error()})
 		} else {
-			m.toast = utils.NewToast([]string{msg.Msg})
+			m.toast = utils.NewSuccessToast([]string{msg.Msg})
 			m.pollRegion = msg.Region
 		}
 		m.refreshGen++
@@ -305,8 +309,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case instances.SSHExitMsg:
 		m.trace.Log("msg=SSHExit err=%v", msg.Err)
 		if msg.Err != nil {
-			m.toast = utils.NewToast([]string{msg.Err.Error()})
-			return m, utils.ScheduleToastExpiry()
+			var exitErr *exec.ExitError
+			if errors.As(msg.Err, &exitErr) && exitErr.ExitCode() == 130 {
+				// Normal Ctrl+C exit from SSH
+			} else {
+				m.toast = utils.NewToast([]string{msg.Err.Error()})
+				return m, utils.ScheduleToastExpiry()
+			}
 		}
 
 	// Refresh tick
@@ -375,6 +384,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case deleteProgressDoneMsg:
 		m.deleteProgress = nil
 
+	case disassocDoneMsg:
+		m.disassocProgress = nil
+		if m.appDetail != nil {
+			return m, applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region)
+		}
+
 	case applications.AppDetailMsg:
 		m.trace.Log("msg=AppDetail err=%v", msg.Err)
 		if msg.Err != nil {
@@ -434,18 +449,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return deleteProgressDoneMsg{} })
 
 	case applications.DisassociateTargetMsg:
+		if m.disassocProgress != nil {
+			if msg.Err != nil {
+				m.disassocProgress.Fail(0, msg.Err)
+				return m, nil
+			}
+			m.disassocProgress.CompleteSub(0, 0)
+			m.disassocProgress.CompleteSub(0, 1)
+			m.disassocProgress.CompleteSub(0, 2)
+			m.disassocProgress.Complete(0)
+		}
 		if msg.Err != nil {
 			m.toast = utils.NewToast([]string{msg.Err.Error()})
 			return m, utils.ScheduleToastExpiry()
 		}
-		m.toast = utils.NewToast([]string{fmt.Sprintf("Disassociated '%s'", msg.InstanceName)})
-		if m.appDetail != nil {
-			return m, tea.Batch(
-				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
-				utils.ScheduleToastExpiry(),
-			)
-		}
-		return m, utils.ScheduleToastExpiry()
+		// Auto-dismiss after a short delay
+		return m, tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg { return disassocDoneMsg{} })
 
 	case applications.AddTargetMsg:
 		m.addTargetLoading = false
@@ -453,7 +472,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toast = utils.NewToast([]string{msg.Err.Error()})
 			return m, utils.ScheduleToastExpiry()
 		}
-		m.toast = utils.NewToast([]string{"Target added"})
+		m.toast = utils.NewSuccessToast([]string{"Target added"})
 		if m.appDetail != nil {
 			return m, tea.Batch(
 				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
@@ -527,6 +546,13 @@ func (m Model) handleRefreshTick(msg instances.RefreshTickMsg) (tea.Model, tea.C
 		mr := instances.MetricRanges[m.metricRange]
 		return m, tea.Batch(
 			instances.FetchMetrics(m.ctx, m.client, m.detailName, m.detailRegion, mr),
+			instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
+		)
+	}
+	if m.view == viewDetail && m.appDetail != nil {
+		m.refreshGen++
+		return m, tea.Batch(
+			applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
 			instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
 		)
 	}
@@ -622,6 +648,16 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("y"))):
 			t := *m.disassocConfirm
 			m.disassocConfirm = nil
+			labels, subs := appsdk.DisassociateSteps(t.Target.Name)
+			m.disassocProgress = utils.NewStepProgress(
+				fmt.Sprintf("Disassociating %s", t.Target.Name),
+				labels...,
+			)
+			if len(subs) > 0 {
+				m.disassocProgress.SetSubSteps(0, subs...)
+				m.disassocProgress.StartSub(0, 0)
+			}
+			m.disassocProgress.Start(0)
 			m.view = viewDetail
 			return m, applications.DisassociateTarget(m.ctx, m.client, t.Target.Name, m.appDetail.Name, t.EnvName, m.appDetail.Region)
 		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
@@ -630,6 +666,14 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if m.disassocProgress != nil && m.disassocProgress.Failed() {
+		if key.Matches(msg, key.NewBinding(key.WithKeys("esc"))) {
+			m.disassocProgress = nil
+			return m, nil
+		}
+		return m, nil
+	}
+
 
 	if m.view == viewAddTarget {
 		switch {
@@ -771,7 +815,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				mr := instances.MetricRanges[m.metricRange]
 				return m, instances.FetchMetrics(m.ctx, m.client, name, region, mr)
 			}
-			m.toast = utils.NewToast([]string{"Already at shortest range"})
+			m.toast = utils.NewSuccessToast([]string{"Already at shortest range"})
 			return m, utils.ScheduleToastExpiry()
 		case key.Matches(msg, key.NewBinding(key.WithKeys("]"))):
 			if m.metricRange < len(instances.MetricRanges)-1 {
@@ -781,7 +825,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				mr := instances.MetricRanges[m.metricRange]
 				return m, instances.FetchMetrics(m.ctx, m.client, name, region, mr)
 			}
-			m.toast = utils.NewToast([]string{"Already at longest range"})
+			m.toast = utils.NewSuccessToast([]string{"Already at longest range"})
 			return m, utils.ScheduleToastExpiry()
 		case key.Matches(msg, key.NewBinding(key.WithKeys("j", "down"))):
 			var cmd tea.Cmd
@@ -1160,6 +1204,8 @@ func (m Model) View() tea.View {
 			// Show progress overlay while adding target
 			modal := utils.TitleStyle.Render(fmt.Sprintf(" %s %s ", m.spinner.View(), m.addTargetStatus))
 			screen = utils.Overlay(detailScreen, modal, m.width, m.height)
+		} else if m.disassocProgress != nil {
+			screen = utils.Overlay(detailScreen, m.disassocProgress.View(m.spinner.View(), m.width), m.width, m.height)
 		} else {
 			screen = detailScreen
 		}

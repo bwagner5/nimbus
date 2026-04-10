@@ -25,7 +25,7 @@ func CreateSteps(appName, envName, target string) (labels []string, targetSubs [
 // DeleteSteps returns the step labels for deleting an application.
 func DeleteSteps(appName string) []string {
 	return []string{
-		"Uninstall watch services",
+		"Uninstall watch services and clean up files",
 		"Remove instance tags",
 		"Delete environment buckets",
 	}
@@ -36,6 +36,7 @@ func DisassociateSteps(instanceName string) (labels []string, cleanupSubs []stri
 	labels = []string{fmt.Sprintf("Disassociate %s", instanceName)}
 	cleanupSubs = []string{
 		"Uninstall watch service",
+		"Remove application files",
 		"Remove instance tag",
 	}
 	return

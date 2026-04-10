@@ -69,14 +69,25 @@ func DeployViaBucket(ctx context.Context, client *aws.Client, appName, envName, 
 
 	fi, _ := f.Stat()
 	fmt.Printf("📤 Uploading %s (%d bytes)...\n", assetName, fi.Size())
-	_, err = s3svc.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        &bucketName,
-		Key:           &assetName,
-		Body:          f,
-		ContentLength: awssdk.Int64(fi.Size()),
-	})
-	if err != nil {
-		return fmt.Errorf("upload to bucket: %w", err)
+
+	var uploadErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+			f.Seek(0, 0)
+		}
+		_, uploadErr = s3svc.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:        &bucketName,
+			Key:           &assetName,
+			Body:          f,
+			ContentLength: awssdk.Int64(fi.Size()),
+		})
+		if uploadErr == nil {
+			break
+		}
+	}
+	if uploadErr != nil {
+		return fmt.Errorf("upload to bucket: %w", uploadErr)
 	}
 
 	fmt.Printf("✅ Deployed %s to %s/%s (bucket: %s)\n", assetName, appName, envName, bucketName)

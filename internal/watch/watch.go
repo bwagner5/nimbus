@@ -50,6 +50,11 @@ func Watch(ctx context.Context, appName, envName, region string, interval time.D
 	s3svc := s3.NewFromConfig(cfg)
 
 	instanceName, _ := getInstanceName()
+	if data, err := os.ReadFile(filepath.Join(baseDir, ".instance")); err == nil {
+		if n := strings.TrimSpace(string(data)); n != "" {
+			instanceName = n
+		}
+	}
 	if instanceName == "" {
 		h, _ := os.Hostname()
 		instanceName = h
@@ -67,6 +72,20 @@ func Watch(ctx context.Context, appName, envName, region string, interval time.D
 
 	var lastStatus string
 	lastStatusUpload := time.Time{}
+
+	// Upload initial status immediately on startup
+	initStatus := buildStatus(instanceName, bucketName, region, lastKey, currentDir)
+	initJSON, _ := json.Marshal(initStatus)
+	statusKey := instanceName + "_status.json"
+	s3svc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      &bucketName,
+		Key:         &statusKey,
+		Body:        bytes.NewReader(initJSON),
+		ContentType: strPtr("application/json"),
+	})
+	lastStatus = string(initJSON)
+	lastStatusUpload = time.Now()
+	log.Println("Initial status uploaded")
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -310,7 +329,17 @@ func getContainerInfo(currentDir string) ([]applications.ContainerStatus, []stri
 
 func getPublicIP() string {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://169.254.169.254/latest/meta-data/public-ipv4")
+	tokenReq, _ := http.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
+	tokenReq.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "30")
+	tokenResp, err := client.Do(tokenReq)
+	if err != nil {
+		return ""
+	}
+	defer tokenResp.Body.Close()
+	token, _ := io.ReadAll(tokenResp.Body)
+	req, _ := http.NewRequest("GET", "http://169.254.169.254/latest/meta-data/public-ipv4", nil)
+	req.Header.Set("X-aws-ec2-metadata-token", string(token))
+	resp, err := client.Do(req)
 	if err != nil {
 		return ""
 	}
@@ -321,7 +350,17 @@ func getPublicIP() string {
 
 func getInstanceName() (string, error) {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://169.254.169.254/latest/meta-data/tags/instance/Name")
+	tokenReq, _ := http.NewRequest("PUT", "http://169.254.169.254/latest/api/token", nil)
+	tokenReq.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "30")
+	tokenResp, err := client.Do(tokenReq)
+	if err != nil {
+		return "", err
+	}
+	defer tokenResp.Body.Close()
+	token, _ := io.ReadAll(tokenResp.Body)
+	req, _ := http.NewRequest("GET", "http://169.254.169.254/latest/meta-data/tags/instance/Name", nil)
+	req.Header.Set("X-aws-ec2-metadata-token", string(token))
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}

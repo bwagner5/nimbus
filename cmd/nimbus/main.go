@@ -205,17 +205,11 @@ func handleList(args []string) {
 
 func handleDeploy(args []string) {
 	fs := flag.NewFlagSet("nimbus application deploy", flag.ExitOnError)
-	name := fs.String("name", "", "Application name (required)")
-	env := fs.String("env", "dev", "Environment name")
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "Environment name")
 	region := fs.String("region", "", "AWS region (defaults to AWS_REGION or us-east-1)")
 	useSSH := fs.Bool("ssh", false, "Use SSH/SCP deploy instead of bucket upload")
 	fs.Parse(args)
-
-	if *name == "" {
-		fmt.Fprintln(os.Stderr, "Error: --name is required")
-		fs.Usage()
-		os.Exit(1)
-	}
 
 	r := resolveRegion(*region)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -227,11 +221,18 @@ func handleDeploy(args []string) {
 	}
 
 	if *useSSH {
+		if *name == "" {
+			fmt.Fprintln(os.Stderr, "Error: --name is required for SSH deploy")
+			os.Exit(1)
+		}
+		if *env == "" {
+			*env = "dev"
+		}
 		if err := deploy.Deploy(ctx, client, *name, *env, r); err != nil {
 			fatal(err)
 		}
 	} else {
-		if err := deploy.DeployViaBucket(ctx, client, *name, *env, r); err != nil {
+		if err := deploy.RunInteractiveDeploy(ctx, client, *name, *env, r); err != nil {
 			fatal(err)
 		}
 	}
@@ -310,12 +311,14 @@ func handleInstallWatch(args []string) {
 
 func handleLocal(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: nimbus application local <command>\n\nCommands:\n  list  List app environments on this instance\n")
+		fmt.Fprintf(os.Stderr, "Usage: nimbus application local <command>\n\nCommands:\n  list  List app environments on this instance\n  rm    Remove app/env directory from this instance\n")
 		os.Exit(1)
 	}
 	switch args[0] {
 	case "list", "ls":
 		handleLocalList()
+	case "rm", "remove":
+		handleLocalRm(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: nimbus application local %s\n", args[0])
 		os.Exit(1)
@@ -335,6 +338,24 @@ func handleLocalList() {
 	for _, e := range envs {
 		fmt.Printf("%-20s %-12s %-14s %s\n", e.App, e.Env, e.Status, e.Unit)
 	}
+}
+
+func handleLocalRm(args []string) {
+	fs := flag.NewFlagSet("nimbus application local rm", flag.ExitOnError)
+	name := fs.String("name", "", "Application name (required)")
+	env := fs.String("env", "", "Environment name (required)")
+	fs.Parse(args)
+
+	if *name == "" || *env == "" {
+		fmt.Fprintln(os.Stderr, "Error: --name and --env are required")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	if err := applications.LocalRemove(*name, *env); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("✅ Removed /opt/nimbus/%s/%s\n", *name, *env)
 }
 
 func handleUninstallWatch(args []string) {
