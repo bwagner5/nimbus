@@ -289,7 +289,7 @@ func (s *CreateScreen) doUploadBinary() tea.Cmd {
 func (s *CreateScreen) doInstallWatch() tea.Cmd {
 	client, target, appName, envName, region, ctx := s.client, s.target, s.appName, s.envName, s.region, s.ctx
 	return func() tea.Msg {
-		err := applications.NewClient(client).InstallWatch(ctx, target, appName, envName, region)
+		err := applications.NewClient(client).RemoteUp(ctx, target, appName, envName, region)
 		return installWatchDoneMsg{Err: err}
 	}
 }

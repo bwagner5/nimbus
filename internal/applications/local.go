@@ -77,16 +77,38 @@ func serviceStatus(unit string) string {
 	return state
 }
 
-// LocalRemove removes the env directory for an app/env and the app directory if empty.
-func LocalRemove(appName, envName string) error {
+// LocalDown fully tears down an app/env on this instance:
+// 1. docker compose down on the current deployment
+// 2. uninstall the watch service
+// 3. remove the env directory (and the app directory if empty)
+func LocalDown(appName, envName string) error {
 	envDir := fmt.Sprintf("/opt/nimbus/%s/%s", appName, envName)
+	currentDir := fmt.Sprintf("%s/current", envDir)
+
+	// 1. Bring down running containers
+	for _, name := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
+		p := currentDir + "/" + name
+		if _, err := os.Stat(p); err == nil {
+			down := exec.Command("docker", "compose", "-f", p, "down")
+			down.Dir = currentDir
+			down.Stdout = os.Stdout
+			down.Stderr = os.Stderr
+			down.Run() // best-effort
+			break
+		}
+	}
+
+	// 2. Uninstall watch service
+	UninstallWatchService(appName, envName) // best-effort
+
+	// 3. Remove directory
 	if err := os.RemoveAll(envDir); err != nil {
 		return fmt.Errorf("remove %s: %w", envDir, err)
 	}
 	appDir := fmt.Sprintf("/opt/nimbus/%s", appName)
 	entries, err := os.ReadDir(appDir)
 	if err != nil {
-		return nil // already gone
+		return nil
 	}
 	if len(entries) == 0 {
 		os.Remove(appDir)

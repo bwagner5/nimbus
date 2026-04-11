@@ -342,7 +342,7 @@ func (c *Client) Delete(ctx context.Context, appName, region string) error {
 	return c.DeleteBuckets(ctx, appName, region)
 }
 
-// CleanupInstances SSHes to each tagged instance for the app and runs uninstall-watch.
+// CleanupInstances SSHes to each tagged instance for the app and runs 'local down'.
 func (c *Client) CleanupInstances(ctx context.Context, appName, region string) error {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
 	prefix := TagPrefix + appName + ":"
@@ -355,8 +355,7 @@ func (c *Client) CleanupInstances(ctx context.Context, appName, region string) e
 			if envName == "" || inst.Name == nil {
 				continue
 			}
-			c.UninstallWatch(ctx, *inst.Name, appName, envName, region) // best-effort
-			c.RemoveLocal(ctx, *inst.Name, appName, envName, region)   // best-effort
+			c.RemoteDown(ctx, *inst.Name, appName, envName, region) // best-effort
 		}
 	})
 	return nil
@@ -423,7 +422,7 @@ func (c *Client) AddTarget(ctx context.Context, instanceName, appName, envName, 
 	if err := c.UploadBinary(ctx, instanceName, region); err != nil {
 		return err
 	}
-	return c.InstallWatch(ctx, instanceName, appName, envName, region)
+	return c.RemoteUp(ctx, instanceName, appName, envName, region)
 }
 
 // TagTarget tags an instance as a deployment target for an app/env.
@@ -504,8 +503,8 @@ func sshTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, 5*time.Minute)
 }
 
-// InstallWatch SSHes to the instance and runs nimbus app install-watch.
-func (c *Client) InstallWatch(ctx context.Context, instanceName, appName, envName, region string) error {
+// RemoteUp SSHes to the instance and runs nimbus app local up.
+func (c *Client) RemoteUp(ctx context.Context, instanceName, appName, envName, region string) error {
 	ctx, cancel := sshTimeout(ctx)
 	defer cancel()
 
@@ -516,20 +515,20 @@ func (c *Client) InstallWatch(ctx context.Context, instanceName, appName, envNam
 	defer os.Remove(creds.KeyPath)
 	defer os.Remove(creds.KeyPath + "-cert.pub")
 
-	remoteCmd := fmt.Sprintf("sudo /usr/local/bin/nimbus app install-watch --name %s --env %s", appName, envName)
+	remoteCmd := fmt.Sprintf("sudo /usr/local/bin/nimbus app local up --name %s --env %s", appName, envName)
 	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
 	cmd := exec.CommandContext(ctx, "ssh", append(sshOptions(creds.KeyPath), sshTarget, remoteCmd)...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("install-watch timed out after 5m: %w", ctx.Err())
+			return fmt.Errorf("remote up timed out after 5m: %w", ctx.Err())
 		}
-		return fmt.Errorf("install-watch: %s: %w", strings.TrimSpace(string(output)), err)
+		return fmt.Errorf("remote up: %s: %w", strings.TrimSpace(string(output)), err)
 	}
 	return nil
 }
 
-// UninstallWatch SSHes to the instance and runs nimbus app uninstall-watch.
-func (c *Client) UninstallWatch(ctx context.Context, instanceName, appName, envName, region string) error {
+// RemoteDown SSHes to the instance and runs nimbus app local down.
+func (c *Client) RemoteDown(ctx context.Context, instanceName, appName, envName, region string) error {
 	ctx, cancel := sshTimeout(ctx)
 	defer cancel()
 
@@ -540,41 +539,20 @@ func (c *Client) UninstallWatch(ctx context.Context, instanceName, appName, envN
 	defer os.Remove(creds.KeyPath)
 	defer os.Remove(creds.KeyPath + "-cert.pub")
 
-	remoteCmd := fmt.Sprintf("sudo /usr/local/bin/nimbus app uninstall-watch --name %s --env %s", appName, envName)
-	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
-	cmd := exec.CommandContext(ctx, "ssh", append(sshOptions(creds.KeyPath), sshTarget, remoteCmd)...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("uninstall-watch: %s: %w", strings.TrimSpace(string(output)), err)
-	}
-	return nil
-}
-
-// RemoveLocal SSHes to the instance and runs nimbus app local rm.
-func (c *Client) RemoveLocal(ctx context.Context, instanceName, appName, envName, region string) error {
-	ctx, cancel := sshTimeout(ctx)
-	defer cancel()
-
-	creds, err := c.GetSSHCredentials(ctx, instanceName, region)
-	if err != nil {
-		return fmt.Errorf("get SSH credentials: %w", err)
-	}
-	defer os.Remove(creds.KeyPath)
-	defer os.Remove(creds.KeyPath + "-cert.pub")
-
-	remoteCmd := fmt.Sprintf("sudo /usr/local/bin/nimbus app local rm --name %s --env %s", appName, envName)
+	remoteCmd := fmt.Sprintf("sudo /usr/local/bin/nimbus app local down --name %s --env %s", appName, envName)
 	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
 	cmd := exec.CommandContext(ctx, "ssh", append(sshOptions(creds.KeyPath), sshTarget, remoteCmd)...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("local rm timed out after 5m: %w", ctx.Err())
+			return fmt.Errorf("remote down timed out after 5m: %w", ctx.Err())
 		}
-		return fmt.Errorf("local rm: %s: %w", strings.TrimSpace(string(output)), err)
+		return fmt.Errorf("remote down: %s: %w", strings.TrimSpace(string(output)), err)
 	}
 	return nil
 }
 
 // RemoveTarget removes an instance's association tag for an app/env.
-// If cleanup is true, it SSHes to the instance to stop the watch service and remove deploy dirs.
+// If cleanup is true, it SSHes to the instance and runs 'nimbus app local down'.
 func (c *Client) RemoveTarget(ctx context.Context, instanceName, appName, envName, region string, cleanup bool) error {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
 	tagKey := fmt.Sprintf("%s%s:%s", TagPrefix, appName, envName)
@@ -590,8 +568,7 @@ func (c *Client) RemoveTarget(ctx context.Context, instanceName, appName, envNam
 		return nil
 	}
 
-	c.UninstallWatch(ctx, instanceName, appName, envName, region) // best-effort
-	c.RemoveLocal(ctx, instanceName, appName, envName, region)   // best-effort
+	c.RemoteDown(ctx, instanceName, appName, envName, region) // best-effort: compose down + uninstall watch + remove files
 	return nil
 }
 
@@ -696,7 +673,7 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=/opt/nimbus/%s/%s/.credentials
-ExecStart=/usr/local/bin/nimbus application watch --name %s --env %s
+ExecStart=/usr/local/bin/nimbus application local watch --name %s --env %s
 Restart=always
 RestartSec=10
 

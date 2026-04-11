@@ -25,12 +25,133 @@ var appCommands = map[string]bool{
 
 var knownCommands = []string{"app", "application", "applications"}
 
+// ── help rendering ──────────────────────────────────────────────────────
+
+func bold(s string) string  { return "\033[1m" + s + "\033[0m" }
+func dim(s string) string   { return "\033[2m" + s + "\033[0m" }
+func cyan(s string) string  { return "\033[36m" + s + "\033[0m" }
+func green(s string) string { return "\033[32m" + s + "\033[0m" }
+
+type cmdEntry struct {
+	name string
+	desc string
+}
+
+func printHelp(header string, sections []struct {
+	title   string
+	entries []cmdEntry
+}, footer string) {
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, bold(header))
+	for _, sec := range sections {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(os.Stderr, "  %s\n", cyan(sec.title))
+		for _, e := range sec.entries {
+			fmt.Fprintf(os.Stderr, "    %-24s %s\n", green(e.name), e.desc)
+		}
+	}
+	if footer != "" {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, dim(footer))
+	}
+	fmt.Fprintln(os.Stderr)
+}
+
+// ── root ────────────────────────────────────────────────────────────────
+
+func rootHelp() {
+	printHelp(
+		"nimbus — a delightful cloud dashboard & deployment tool",
+		[]struct {
+			title   string
+			entries []cmdEntry
+		}{
+			{
+				title: "Interactive",
+				entries: []cmdEntry{
+					{"nimbus", "Launch the TUI dashboard"},
+				},
+			},
+			{
+				title: "Commands",
+				entries: []cmdEntry{
+					{"nimbus app <command>", "Manage applications & deployments"},
+				},
+			},
+			{
+				title: "Global Flags",
+				entries: []cmdEntry{
+					{"--trace", "Enable trace logging of TUI actions"},
+					{"--trace-file <path>", "Path to trace output (default: nimbus-trace.log)"},
+				},
+			},
+		},
+		"  Run 'nimbus app --help' for application commands.",
+	)
+}
+
+// ── app ─────────────────────────────────────────────────────────────────
+
+func appHelp() {
+	printHelp(
+		"nimbus app — manage applications & deployments",
+		[]struct {
+			title   string
+			entries []cmdEntry
+		}{
+			{
+				title: "Commands",
+				entries: []cmdEntry{
+					{"list (ls)", "List applications in a region"},
+					{"deploy", "Deploy to targets (bucket upload or SSH)"},
+					{"delete (rm)", "Delete an application and its resources"},
+					{"disassociate", "Remove an instance as a deployment target"},
+				},
+			},
+			{
+				title: "On-Instance",
+				entries: []cmdEntry{
+					{"local", "Commands that run on a deployment target instance"},
+				},
+			},
+		},
+		"  Run 'nimbus app <command> --help' for command-specific flags.\n  Run 'nimbus app local --help' for on-instance commands.",
+	)
+}
+
+// ── leaf command help (flag sets) ───────────────────────────────────────
+
+func flagHelp(fs *flag.FlagSet, usage, description string) {
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, bold(usage))
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, " ", description)
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(os.Stderr, "  %s\n", cyan("Flags"))
+		fs.VisitAll(func(f *flag.Flag) {
+			def := ""
+			if f.DefValue != "" && f.DefValue != "false" && f.DefValue != "0" && f.DefValue != "0s" {
+				def = dim(fmt.Sprintf(" (default: %s)", f.DefValue))
+			}
+			fmt.Fprintf(os.Stderr, "    %-24s %s%s\n", green("--"+f.Name), f.Usage, def)
+		})
+		fmt.Fprintln(os.Stderr)
+	}
+}
+
+// ── main ────────────────────────────────────────────────────────────────
+
 func main() {
 	if len(os.Args) < 2 {
 		handleTUI(os.Args[1:])
 		return
 	}
 	cmd := os.Args[1]
+	if cmd == "--help" || cmd == "-h" || cmd == "help" {
+		rootHelp()
+		return
+	}
 	if appCommands[cmd] {
 		handleApplication(os.Args[2:])
 		return
@@ -91,24 +212,7 @@ func handleTUI(args []string) {
 	fs := flag.NewFlagSet("nimbus", flag.ExitOnError)
 	traceEnabled := fs.Bool("trace", false, "Enable trace logging of TUI actions")
 	traceFile := fs.String("trace-file", "nimbus-trace.log", "Path to trace output file")
-	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Usage: nimbus [flags]
-       nimbus application(s) <command> [flags]
-
-Commands:
-  application list            List applications
-  application deploy          Deploy to target (bucket-based, or --ssh)
-  application delete          Delete an application
-  application watch           Watch for new deployments (runs on instance)
-  application install-watch   Install systemd watch service on instance
-  application uninstall-watch Uninstall systemd watch service on instance
-  application local list      List app environments on this instance
-  application disassociate    Remove an instance as a deployment target
-
-Flags:
-`)
-		fs.PrintDefaults()
-	}
+	fs.Usage = func() { rootHelp() }
 	fs.Parse(args)
 
 	var tracePath string
@@ -132,20 +236,12 @@ Flags:
 }
 
 func handleApplication(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, `Usage: nimbus application <command> [flags]
-
-Commands:
-  list            List applications
-  deploy          Deploy to target (bucket-based, or --ssh)
-  delete          Delete an application
-  watch           Watch for new deployments (runs on instance)
-  install-watch   Install systemd watch service on instance
-  uninstall-watch Uninstall systemd watch service on instance
-  local           Commands to run on a deployment target instance
-  disassociate    Remove an instance as a deployment target
-`)
-		os.Exit(1)
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		appHelp()
+		if len(args) == 0 {
+			os.Exit(1)
+		}
+		return
 	}
 
 	switch args[0] {
@@ -155,25 +251,20 @@ Commands:
 		handleDeploy(args[1:])
 	case "delete", "rm":
 		handleDelete(args[1:])
-	case "watch":
-		handleWatch(args[1:])
-	case "install-watch":
-		handleInstallWatch(args[1:])
-	case "uninstall-watch":
-		handleUninstallWatch(args[1:])
 	case "local":
 		handleLocal(args[1:])
 	case "disassociate":
 		handleDisassociate(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: nimbus application %s\n", args[0])
+		fmt.Fprintf(os.Stderr, "Unknown command: nimbus app %s\n", args[0])
 		os.Exit(1)
 	}
 }
 
 func handleList(args []string) {
-	fs := flag.NewFlagSet("nimbus application list", flag.ExitOnError)
+	fs := flag.NewFlagSet("nimbus app list", flag.ExitOnError)
 	region := fs.String("region", "", "AWS region (defaults to AWS_REGION or us-east-1)")
+	flagHelp(fs, "nimbus app list — list applications", "Show all applications in a region with their state, bucket, and region.")
 	fs.Parse(args)
 
 	r := resolveRegion(*region)
@@ -204,11 +295,12 @@ func handleList(args []string) {
 }
 
 func handleDeploy(args []string) {
-	fs := flag.NewFlagSet("nimbus application deploy", flag.ExitOnError)
+	fs := flag.NewFlagSet("nimbus app deploy", flag.ExitOnError)
 	name := fs.String("name", "", "Application name")
 	env := fs.String("env", "", "Environment name")
 	region := fs.String("region", "", "AWS region (defaults to AWS_REGION or us-east-1)")
 	useSSH := fs.Bool("ssh", false, "Use SSH/SCP deploy instead of bucket upload")
+	flagHelp(fs, "nimbus app deploy — deploy to targets", "Push the current directory to deployment targets via S3 bucket or SSH.\nWithout --ssh, runs an interactive deploy wizard.")
 	fs.Parse(args)
 
 	r := resolveRegion(*region)
@@ -239,9 +331,10 @@ func handleDeploy(args []string) {
 }
 
 func handleDelete(args []string) {
-	fs := flag.NewFlagSet("nimbus application delete", flag.ExitOnError)
+	fs := flag.NewFlagSet("nimbus app delete", flag.ExitOnError)
 	name := fs.String("name", "", "Application name (required)")
 	region := fs.String("region", "", "AWS region (defaults to AWS_REGION or us-east-1)")
+	flagHelp(fs, "nimbus app delete — delete an application", "Remove an application and all its associated resources (buckets, tags, instance configs).")
 	fs.Parse(args)
 
 	if *name == "" {
@@ -267,12 +360,13 @@ func handleDelete(args []string) {
 }
 
 func handleWatch(args []string) {
-	fs := flag.NewFlagSet("nimbus application watch", flag.ExitOnError)
+	fs := flag.NewFlagSet("nimbus app local watch", flag.ExitOnError)
 	name := fs.String("name", "", "Application name (required)")
 	env := fs.String("env", "dev", "Environment name")
 	region := fs.String("region", "", "AWS region (defaults to AWS_REGION or us-east-1)")
 	interval := fs.Duration("interval", 10*time.Second, "Poll interval")
 	keepPrevious := fs.Int("keep-previous", 10, "Number of previous deploy assets to keep")
+	flagHelp(fs, "nimbus app local watch — watch for deployments", "Poll the deploy bucket and automatically apply new assets.\nTypically managed via 'nimbus app local up' as a systemd service.")
 	fs.Parse(args)
 
 	if *name == "" {
@@ -290,10 +384,11 @@ func handleWatch(args []string) {
 	}
 }
 
-func handleInstallWatch(args []string) {
-	fs := flag.NewFlagSet("nimbus application install-watch", flag.ExitOnError)
+func handleUp(args []string) {
+	fs := flag.NewFlagSet("nimbus app local up", flag.ExitOnError)
 	name := fs.String("name", "", "Application name (required)")
 	env := fs.String("env", "dev", "Environment name")
+	flagHelp(fs, "nimbus app local up — start watching for deployments", "Create the app/env directory and install a systemd service that watches for new deployments.")
 	fs.Parse(args)
 
 	if *name == "" {
@@ -302,7 +397,7 @@ func handleInstallWatch(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Installing watch service for %s/%s...\n", *name, *env)
+	fmt.Printf("Starting %s/%s...\n", *name, *env)
 	if err := applications.InstallWatchService(*name, *env); err != nil {
 		fatal(err)
 	}
@@ -310,22 +405,55 @@ func handleInstallWatch(args []string) {
 }
 
 func handleLocal(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: nimbus application local <command>\n\nCommands:\n  list  List app environments on this instance\n  rm    Remove app/env directory from this instance\n")
-		os.Exit(1)
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		printHelp(
+			"nimbus app local — on-instance commands",
+			[]struct {
+				title   string
+				entries []cmdEntry
+			}{
+				{
+					title: "Lifecycle",
+					entries: []cmdEntry{
+						{"up", "Start watching for deployments (install watch service)"},
+						{"down", "Stop containers, uninstall watch service, clean up files"},
+					},
+				},
+				{
+					title: "Inspection",
+					entries: []cmdEntry{
+						{"list (ls)", "List app environments on this instance"},
+						{"watch", "Poll for new deploys and apply them (low-level)"},
+					},
+				},
+			},
+			"  Run 'nimbus app local <command> --help' for command-specific flags.",
+		)
+		if len(args) == 0 {
+			os.Exit(1)
+		}
+		return
 	}
 	switch args[0] {
+	case "up":
+		handleUp(args[1:])
+	case "down":
+		handleDown(args[1:])
 	case "list", "ls":
-		handleLocalList()
-	case "rm", "remove":
-		handleLocalRm(args[1:])
+		handleLocalList(args[1:])
+	case "watch":
+		handleWatch(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: nimbus application local %s\n", args[0])
+		fmt.Fprintf(os.Stderr, "Unknown command: nimbus app local %s\n", args[0])
 		os.Exit(1)
 	}
 }
 
-func handleLocalList() {
+func handleLocalList(args []string) {
+	fs := flag.NewFlagSet("nimbus app local list", flag.ExitOnError)
+	flagHelp(fs, "nimbus app local list — list local environments", "Show app environments deployed to /opt/nimbus on this instance.")
+	fs.Parse(args)
+
 	envs, err := applications.LocalList()
 	if err != nil {
 		fatal(err)
@@ -340,28 +468,11 @@ func handleLocalList() {
 	}
 }
 
-func handleLocalRm(args []string) {
-	fs := flag.NewFlagSet("nimbus application local rm", flag.ExitOnError)
-	name := fs.String("name", "", "Application name (required)")
-	env := fs.String("env", "", "Environment name (required)")
-	fs.Parse(args)
-
-	if *name == "" || *env == "" {
-		fmt.Fprintln(os.Stderr, "Error: --name and --env are required")
-		fs.Usage()
-		os.Exit(1)
-	}
-
-	if err := applications.LocalRemove(*name, *env); err != nil {
-		fatal(err)
-	}
-	fmt.Printf("✅ Removed /opt/nimbus/%s/%s\n", *name, *env)
-}
-
-func handleUninstallWatch(args []string) {
-	fs := flag.NewFlagSet("nimbus application uninstall-watch", flag.ExitOnError)
+func handleDown(args []string) {
+	fs := flag.NewFlagSet("nimbus app local down", flag.ExitOnError)
 	name := fs.String("name", "", "Application name (required)")
 	env := fs.String("env", "dev", "Environment name")
+	flagHelp(fs, "nimbus app local down — stop and clean up a deployment", "Stop running containers, uninstall the watch service, and remove the app/env directory.")
 	fs.Parse(args)
 
 	if *name == "" {
@@ -370,20 +481,21 @@ func handleUninstallWatch(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Uninstalling watch service for %s/%s...\n", *name, *env)
-	if err := applications.UninstallWatchService(*name, *env); err != nil {
+	fmt.Printf("Stopping %s/%s...\n", *name, *env)
+	if err := applications.LocalDown(*name, *env); err != nil {
 		fatal(err)
 	}
-	fmt.Printf("✅ Uninstalled nimbus-watch-%s-%s.service\n", *name, *env)
+	fmt.Printf("✅ Stopped and cleaned up %s/%s\n", *name, *env)
 }
 
 func handleDisassociate(args []string) {
-	fs := flag.NewFlagSet("nimbus application disassociate", flag.ExitOnError)
+	fs := flag.NewFlagSet("nimbus app disassociate", flag.ExitOnError)
 	name := fs.String("name", "", "Application name (required)")
 	env := fs.String("env", "dev", "Environment name")
 	instance := fs.String("instance", "", "Instance name (required)")
 	region := fs.String("region", "", "AWS region")
 	noCleanup := fs.Bool("no-cleanup", false, "Skip stopping services and removing files on the instance")
+	flagHelp(fs, "nimbus app disassociate — remove a deployment target", "Untag an instance and optionally clean up its watch service and deploy files.")
 	fs.Parse(args)
 
 	if *name == "" || *instance == "" {

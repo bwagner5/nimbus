@@ -16,7 +16,7 @@ func CreateSteps(appName, envName, target string) (labels []string, targetSubs [
 			"Create access key",
 			"Write credentials to instance",
 			"Upload nimbus binary",
-			"Install watch service",
+			"Start watch service",
 		}
 	}
 	return
@@ -25,7 +25,7 @@ func CreateSteps(appName, envName, target string) (labels []string, targetSubs [
 // DeleteSteps returns the step labels for deleting an application.
 func DeleteSteps(appName string) []string {
 	return []string{
-		"Uninstall watch services and clean up files",
+		"Stop deployments on instances",
 		"Remove instance tags",
 		"Delete environment buckets",
 	}
@@ -35,9 +35,9 @@ func DeleteSteps(appName string) []string {
 func DisassociateSteps(instanceName string) (labels []string, cleanupSubs []string) {
 	labels = []string{fmt.Sprintf("Disassociate %s", instanceName)}
 	cleanupSubs = []string{
-		"Uninstall watch service",
+		"Stop watch service",
+		"Stop running containers",
 		"Remove application files",
-		"Remove instance tag",
 	}
 	return
 }

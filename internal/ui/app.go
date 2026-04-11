@@ -94,6 +94,7 @@ type Model struct {
 	deleteAppName    string
 	deleteAppReg     string
 	deletedApps     map[string]time.Time      // name -> expiry
+	appFastPollUntil time.Time                // fast-poll app detail until this time
 }
 
 func (v view) String() string {
@@ -463,8 +464,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toast = utils.NewToast([]string{msg.Err.Error()})
 			return m, utils.ScheduleToastExpiry()
 		}
+		m.appFastPollUntil = time.Now().Add(2 * time.Minute)
+		m.trace.Log("fastPoll: triggered by DisassociateTarget, until=%s", m.appFastPollUntil.Format(time.RFC3339))
+		m.refreshGen++
 		// Auto-dismiss after a short delay
-		return m, tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg { return disassocDoneMsg{} })
+		return m, tea.Batch(
+			tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg { return disassocDoneMsg{} }),
+			instances.ScheduleRefresh(m.refreshGen, "fast"),
+		)
 
 	case applications.AddTargetMsg:
 		m.addTargetLoading = false
@@ -473,13 +480,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, utils.ScheduleToastExpiry()
 		}
 		m.toast = utils.NewSuccessToast([]string{"Target added"})
+		m.appFastPollUntil = time.Now().Add(2 * time.Minute)
+		m.trace.Log("fastPoll: triggered by AddTarget, until=%s", m.appFastPollUntil.Format(time.RFC3339))
+		m.refreshGen++
 		if m.appDetail != nil {
 			return m, tea.Batch(
 				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
+				instances.ScheduleRefresh(m.refreshGen, "fast"),
 				utils.ScheduleToastExpiry(),
 			)
 		}
-		return m, utils.ScheduleToastExpiry()
+		return m, tea.Batch(instances.ScheduleRefresh(m.refreshGen, "fast"), utils.ScheduleToastExpiry())
 
 	// Toast / errors
 	case utils.ToastExpireMsg:
@@ -551,9 +562,15 @@ func (m Model) handleRefreshTick(msg instances.RefreshTickMsg) (tea.Model, tea.C
 	}
 	if m.view == viewDetail && m.appDetail != nil {
 		m.refreshGen++
+		fastPoll := time.Now().Before(m.appFastPollUntil)
+		pollHint := m.pollRegion
+		if fastPoll {
+			pollHint = "fast"
+			m.trace.Log("fastPoll: active for appDetail, remaining=%s", time.Until(m.appFastPollUntil).Truncate(time.Second))
+		}
 		return m, tea.Batch(
 			applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
-			instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
+			instances.ScheduleRefresh(m.refreshGen, pollHint),
 		)
 	}
 	m.refreshing = true
