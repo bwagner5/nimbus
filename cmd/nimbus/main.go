@@ -104,6 +104,9 @@ func appHelp() {
 				entries: []cmdEntry{
 					{"list (ls)", "List applications in a region"},
 					{"deploy", "Deploy to targets (bucket upload or SSH)"},
+					{"rollback", "Roll back to the previous deployment"},
+					{"promote", "Promote a deploy from one env to another"},
+					{"env", "Manage environments (add, list, reorder)"},
 					{"delete (rm)", "Delete an application and its resources"},
 					{"disassociate", "Remove an instance as a deployment target"},
 				},
@@ -249,12 +252,18 @@ func handleApplication(args []string) {
 		handleList(args[1:])
 	case "deploy":
 		handleDeploy(args[1:])
+	case "rollback":
+		handleRollback(args[1:])
 	case "delete", "rm":
 		handleDelete(args[1:])
 	case "local":
 		handleLocal(args[1:])
 	case "disassociate":
 		handleDisassociate(args[1:])
+	case "env":
+		handleEnv(args[1:])
+	case "promote":
+		handlePromote(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: nimbus app %s\n", args[0])
 		os.Exit(1)
@@ -330,18 +339,13 @@ func handleDeploy(args []string) {
 	}
 }
 
-func handleDelete(args []string) {
-	fs := flag.NewFlagSet("nimbus app delete", flag.ExitOnError)
-	name := fs.String("name", "", "Application name (required)")
+func handleRollback(args []string) {
+	fs := flag.NewFlagSet("nimbus app rollback", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "Environment name")
 	region := fs.String("region", "", "AWS region (defaults to AWS_REGION or us-east-1)")
-	flagHelp(fs, "nimbus app delete — delete an application", "Remove an application and all its associated resources (buckets, tags, instance configs).")
+	flagHelp(fs, "nimbus app rollback — roll back to previous deployment", "Copy the previous deploy asset to a new key with the current timestamp,\ncreating a roll-forward entry that the watch service picks up automatically.\nIf --name/--env are omitted, prompts for selection.")
 	fs.Parse(args)
-
-	if *name == "" {
-		fmt.Fprintln(os.Stderr, "Error: --name is required")
-		fs.Usage()
-		os.Exit(1)
-	}
 
 	r := resolveRegion(*region)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -352,11 +356,43 @@ func handleDelete(args []string) {
 		fatal(err)
 	}
 
-	fmt.Printf("Deleting application %s...\n", *name)
-	if err := applications.NewClient(client).Delete(ctx, *name, r); err != nil {
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("✅ Deleted application %s\n", *name)
+	envName := selectEnv(app, *env)
+
+	if err := deploy.Rollback(ctx, client, app.Name, envName, r); err != nil {
+		fatal(err)
+	}
+}
+
+func handleDelete(args []string) {
+	fs := flag.NewFlagSet("nimbus app delete", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	region := fs.String("region", "", "AWS region (defaults to AWS_REGION or us-east-1)")
+	flagHelp(fs, "nimbus app delete — delete an application", "Remove an application and all its associated resources (buckets, tags, instance configs).\nIf --name is omitted, prompts for selection.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	fmt.Printf("Deleting application %s...\n", app.Name)
+	if err := applications.NewClient(client).Delete(ctx, app.Name, r); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("✅ Deleted application %s\n", app.Name)
 }
 
 func handleWatch(args []string) {
@@ -490,19 +526,13 @@ func handleDown(args []string) {
 
 func handleDisassociate(args []string) {
 	fs := flag.NewFlagSet("nimbus app disassociate", flag.ExitOnError)
-	name := fs.String("name", "", "Application name (required)")
-	env := fs.String("env", "dev", "Environment name")
-	instance := fs.String("instance", "", "Instance name (required)")
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "Environment name")
+	instance := fs.String("instance", "", "Instance name")
 	region := fs.String("region", "", "AWS region")
-	noCleanup := fs.Bool("no-cleanup", false, "Skip stopping services and removing files on the instance")
-	flagHelp(fs, "nimbus app disassociate — remove a deployment target", "Untag an instance and optionally clean up its watch service and deploy files.")
+	noCleanup := fs.Bool("no-cleanup", false, "Skip running 'nimbus app local down' on the instance")
+	flagHelp(fs, "nimbus app disassociate — remove a deployment target", "Untag an instance and run 'nimbus app local down' to clean up.\nIf --name/--instance are omitted, prompts for selection.")
 	fs.Parse(args)
-
-	if *name == "" || *instance == "" {
-		fmt.Fprintln(os.Stderr, "Error: --name and --instance are required")
-		fs.Usage()
-		os.Exit(1)
-	}
 
 	r := resolveRegion(*region)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -513,12 +543,231 @@ func handleDisassociate(args []string) {
 		fatal(err)
 	}
 
-	cleanup := !*noCleanup
-	fmt.Printf("Disassociating %s from %s/%s...\n", *instance, *name, *env)
-	if err := applications.NewClient(client).RemoveTarget(ctx, *instance, *name, *env, r, cleanup); err != nil {
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("✅ Disassociated %s from %s/%s\n", *instance, *name, *env)
+	envName := selectEnv(app, *env)
+	instName, err := selectTarget(ctx, client, app.Name, envName, r, *instance)
+	if err != nil {
+		fatal(err)
+	}
+
+	cleanup := !*noCleanup
+	fmt.Printf("Disassociating %s from %s/%s...\n", instName, app.Name, envName)
+	if err := applications.NewClient(client).RemoveTarget(ctx, instName, app.Name, envName, r, cleanup); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("✅ Disassociated %s from %s/%s\n", instName, app.Name, envName)
+}
+
+func handleEnv(args []string) {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
+		printHelp("nimbus app env — manage environments", []struct {
+			title   string
+			entries []cmdEntry
+		}{{title: "Commands", entries: []cmdEntry{
+			{"add", "Add a new environment to an application"},
+			{"list (ls)", "List environments in order"},
+			{"reorder", "Set environment order"},
+		}}}, "")
+		return
+	}
+	switch args[0] {
+	case "add":
+		handleEnvAdd(args[1:])
+	case "list", "ls":
+		handleEnvList(args[1:])
+	case "reorder":
+		handleEnvReorder(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown command: nimbus app env %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func handleEnvAdd(args []string) {
+	fs := flag.NewFlagSet("nimbus app env add", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "New environment name")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app env add — add a new environment", "Create a new environment bucket and update the environment order.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	envName := *env
+	if envName == "" {
+		fmt.Fprintf(os.Stderr, "Environment name: ")
+		fmt.Scan(&envName)
+	}
+	if envName == "" {
+		fmt.Fprintln(os.Stderr, "Error: environment name is required")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Adding environment %s to %s...\n", envName, app.Name)
+	if err := applications.NewClient(client).AddEnvironment(ctx, app.Name, envName, r); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("✅ Added environment %s to %s\n", envName, app.Name)
+}
+
+func handleEnvList(args []string) {
+	fs := flag.NewFlagSet("nimbus app env list", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app env list — list environments in order", "Show the environment pipeline order for an application.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	order, err := applications.NewClient(client).GetEnvOrder(ctx, app.Name, r)
+	if err != nil {
+		fatal(err)
+	}
+	if len(order) == 0 {
+		fmt.Println("No environments found")
+		return
+	}
+	for i, e := range order {
+		fmt.Printf("  %d. %s\n", i+1, e)
+	}
+}
+
+func handleEnvReorder(args []string) {
+	fs := flag.NewFlagSet("nimbus app env reorder", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	order := fs.String("order", "", "Comma-separated environment order (e.g. dev,staging,prod)")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app env reorder — set environment order", "Set the pipeline order for environments. If --order is omitted, shows current order and prompts.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	appClient := applications.NewClient(client)
+	var newOrder []string
+	if *order != "" {
+		newOrder = strings.Split(*order, ",")
+	} else {
+		current, err := appClient.GetEnvOrder(ctx, app.Name, r)
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Println("Current order:")
+		for i, e := range current {
+			fmt.Printf("  %d. %s\n", i+1, e)
+		}
+		fmt.Fprintf(os.Stderr, "New order (comma-separated): ")
+		var input string
+		fmt.Scan(&input)
+		newOrder = strings.Split(input, ",")
+	}
+
+	if len(newOrder) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: order must not be empty")
+		os.Exit(1)
+	}
+
+	if err := appClient.SetEnvOrder(ctx, app.Name, r, newOrder); err != nil {
+		fatal(err)
+	}
+	fmt.Println("✅ Environment order updated")
+}
+
+func handlePromote(args []string) {
+	fs := flag.NewFlagSet("nimbus app promote", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	from := fs.String("from", "", "Source environment")
+	to := fs.String("to", "", "Destination environment")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app promote — promote a deploy between environments", "Copy the latest deploy asset from one environment to another.\nIf flags are omitted, prompts for selection.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	appClient := applications.NewClient(client)
+	order, err := appClient.GetEnvOrder(ctx, app.Name, r)
+	if err != nil {
+		fatal(err)
+	}
+	if len(order) < 2 {
+		fatal(fmt.Errorf("need at least 2 environments to promote, found %d", len(order)))
+	}
+
+	srcEnv := *from
+	if srcEnv == "" {
+		idx := promptSelect("Source environment", order)
+		srcEnv = order[idx]
+	}
+
+	destEnv := *to
+	if destEnv == "" {
+		// Default to next env in order
+		var destOptions []string
+		for _, e := range order {
+			if e != srcEnv {
+				destOptions = append(destOptions, e)
+			}
+		}
+		if len(destOptions) == 0 {
+			fatal(fmt.Errorf("no destination environments available"))
+		}
+		idx := promptSelect("Destination environment", destOptions)
+		destEnv = destOptions[idx]
+	}
+
+	if err := deploy.Promote(ctx, client, app.Name, srcEnv, destEnv, r); err != nil {
+		fatal(err)
+	}
 }
 
 func resolveRegion(r string) string {

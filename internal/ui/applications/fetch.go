@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/wagnerbm/nimbusv2/internal/applications"
 	"github.com/wagnerbm/nimbusv2/internal/aws"
+	"github.com/wagnerbm/nimbusv2/internal/deploy"
 	"github.com/wagnerbm/nimbusv2/internal/ui/utils"
 )
 
@@ -128,7 +129,7 @@ func DeleteAppTags(ctx context.Context, client *aws.Client, appName, region stri
 	}
 }
 
-// DeleteAppBuckets deletes env buckets (step 2 of delete).
+// DeleteAppBuckets deletes env buckets (step 4 of delete).
 func DeleteAppBuckets(ctx context.Context, client *aws.Client, appName, region string) tea.Cmd {
 	return func() tea.Msg {
 		err := applications.NewClient(client).DeleteBuckets(ctx, appName, region)
@@ -136,6 +137,20 @@ func DeleteAppBuckets(ctx context.Context, client *aws.Client, appName, region s
 			return DeleteAppMsg{Err: err, Name: appName}
 		}
 		return DeleteAppMsg{Name: appName}
+	}
+}
+
+// CleanupFirewallDoneMsg signals firewall cleanup step completed.
+type CleanupFirewallDoneMsg struct {
+	Err  error
+	Name string
+}
+
+// CleanupAppFirewall cleans up firewall rules (step 3 of delete).
+func CleanupAppFirewall(ctx context.Context, client *aws.Client, appName, region string) tea.Cmd {
+	return func() tea.Msg {
+		err := applications.NewClient(client).CleanupFirewall(ctx, appName, region)
+		return CleanupFirewallDoneMsg{Err: err, Name: appName}
 	}
 }
 
@@ -223,4 +238,63 @@ func RenderInstanceSelectModal(instances []applications.Target, cursor int) stri
 	}
 	b.WriteString("\n" + utils.HelpStyle.Render(" enter:select  esc:cancel "))
 	return b.String()
+}
+
+// AddEnvMsg signals environment addition completed.
+type AddEnvMsg struct {
+	Err     error
+	AppName string
+	EnvName string
+}
+
+// AddEnv creates a new environment for an app.
+func AddEnv(ctx context.Context, client *aws.Client, appName, envName, region string) tea.Cmd {
+	return func() tea.Msg {
+		err := applications.NewClient(client).AddEnvironment(ctx, appName, envName, region)
+		return AddEnvMsg{Err: err, AppName: appName, EnvName: envName}
+	}
+}
+
+// ReorderEnvMsg signals environment reorder completed.
+type ReorderEnvMsg struct {
+	Err   error
+	Order []string
+}
+
+// ReorderEnv sets the environment order for an app.
+func ReorderEnv(ctx context.Context, client *aws.Client, appName, region string, order []string) tea.Cmd {
+	return func() tea.Msg {
+		err := applications.NewClient(client).SetEnvOrder(ctx, appName, region, order)
+		return ReorderEnvMsg{Err: err, Order: order}
+	}
+}
+
+// EnvOrderMsg carries the current environment order.
+type EnvOrderMsg struct {
+	Err   error
+	Order []string
+}
+
+// FetchEnvOrder fetches the environment order for an app.
+func FetchEnvOrder(ctx context.Context, client *aws.Client, appName, region string) tea.Cmd {
+	return func() tea.Msg {
+		order, err := applications.NewClient(client).GetEnvOrder(ctx, appName, region)
+		return EnvOrderMsg{Err: err, Order: order}
+	}
+}
+
+// PromoteMsg signals promotion completed.
+type PromoteMsg struct {
+	Err     error
+	SrcEnv  string
+	DestEnv string
+}
+
+// PromoteDeploy promotes the latest deploy from one env to another.
+func PromoteDeploy(ctx context.Context, client *aws.Client, appName, srcEnv, destEnv, region string) tea.Cmd {
+	return func() tea.Msg {
+		// Use the deploy package's Promote which handles access keys and transfer
+		err := deploy.Promote(ctx, client, appName, srcEnv, destEnv, region)
+		return PromoteMsg{Err: err, SrcEnv: srcEnv, DestEnv: destEnv}
+	}
 }

@@ -27,6 +27,7 @@ func DeleteSteps(appName string) []string {
 	return []string{
 		"Stop deployments on instances",
 		"Remove instance tags",
+		"Clean up firewall rules",
 		"Delete environment buckets",
 	}
 }
@@ -40,4 +41,20 @@ func DisassociateSteps(instanceName string) (labels []string, cleanupSubs []stri
 		"Remove application files",
 	}
 	return
+}
+
+// AddEnvSteps returns the step labels for adding an environment.
+func AddEnvSteps(appName, envName string) []string {
+	return []string{
+		fmt.Sprintf("Create bucket for %s/%s", appName, envName),
+		"Update environment order",
+	}
+}
+
+// PromoteSteps returns the step labels for promoting between environments.
+func PromoteSteps(srcEnv, destEnv string) []string {
+	return []string{
+		fmt.Sprintf("Download latest deploy from %s", srcEnv),
+		fmt.Sprintf("Upload to %s", destEnv),
+	}
 }

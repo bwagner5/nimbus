@@ -40,18 +40,5 @@ func RenderApplications(provider resources.Provider, filtered []resources.Resour
 	content := b.String()
 	help := " q:quit  /:filter  ::resources  r:regions  enter:details  c:create  d:delete  R:refresh  j/k:navigate "
 
-	if progress != "" {
-		progressLine := utils.HelpStyle.Width(width).Render(" " + spinnerView + " " + progress)
-		lines := strings.Split(content, "\n")
-		ph := height - 2
-		for len(lines) < ph {
-			lines = append(lines, "")
-		}
-		if len(lines) > ph {
-			lines = lines[:ph]
-		}
-		content = strings.Join(lines, "\n") + "\n" + progressLine
-	}
-
 	return utils.RenderWithStatusBar(content, help, width, height)
 }

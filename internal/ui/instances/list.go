@@ -47,20 +47,6 @@ func RenderResources(provider resources.Provider, filtered []resources.Resource,
 	}
 	help := fmt.Sprintf(" q:quit  /:filter  ::resources  r:regions  enter:details  c:create  %s  d:delete  x:shell  R:refresh  j/k:navigate ", sLabel)
 
-	if progress != "" {
-		progressLine := utils.HelpStyle.Width(width).Render(" " + spinnerView + " " + progress)
-		// Reserve 2 lines at bottom: progress + help
-		lines := strings.Split(content, "\n")
-		ph := height - 2
-		for len(lines) < ph {
-			lines = append(lines, "")
-		}
-		if len(lines) > ph {
-			lines = lines[:ph]
-		}
-		content = strings.Join(lines, "\n") + "\n" + progressLine
-	}
-
 	return utils.RenderWithStatusBar(content, help, width, height)
 }
 

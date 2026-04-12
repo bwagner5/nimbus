@@ -334,11 +334,17 @@ func (c *Client) Create(ctx context.Context, accountID, appName, envName, region
 	return err
 }
 
-// Delete removes all instance tags for the app and deletes all env buckets.
+// Delete performs the full application deletion workflow:
+// 1. Stop deployments on all target instances (local down)
+// 2. Remove instance tags
+// 3. Clean up firewall rules (only if no other app needs them)
+// 4. Delete environment buckets
 func (c *Client) Delete(ctx context.Context, appName, region string) error {
+	c.CleanupInstances(ctx, appName, region) // best-effort
 	if err := c.DeleteTags(ctx, appName, region); err != nil {
 		return err
 	}
+	c.CleanupFirewall(ctx, appName, region) // best-effort
 	return c.DeleteBuckets(ctx, appName, region)
 }
 
@@ -794,4 +800,40 @@ func (c *Client) OpenFirewallPorts(ctx context.Context, instanceName, region str
 		PortInfos:    rules,
 	})
 	return err
+}
+
+// CleanupFirewall removes non-default firewall rules from instances that were
+// targets of the given app, but only if no other nimbus app is tagged on them.
+func (c *Client) CleanupFirewall(ctx context.Context, appName, region string) error {
+	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
+	c.forEachInstance(ctx, svc, func(inst lstypes.Instance) {
+		if inst.Name == nil {
+			return
+		}
+		// Check if this instance was a target for the app being deleted
+		wasTarget := false
+		otherApps := false
+		for _, tag := range inst.Tags {
+			if tag.Key == nil || !strings.HasPrefix(*tag.Key, TagPrefix) {
+				continue
+			}
+			tagApp := strings.SplitN(strings.TrimPrefix(*tag.Key, TagPrefix), ":", 2)[0]
+			if tagApp == appName {
+				wasTarget = true
+			} else {
+				otherApps = true
+			}
+		}
+		if !wasTarget || otherApps {
+			return
+		}
+		// No other nimbus apps — reset to default ports (SSH only)
+		svc.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
+			InstanceName: inst.Name,
+			PortInfos: []lstypes.PortInfo{
+				{FromPort: 22, ToPort: 22, Protocol: lstypes.NetworkProtocolTcp, Cidrs: []string{"0.0.0.0/0"}},
+			},
+		})
+	})
+	return nil
 }

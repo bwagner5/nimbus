@@ -48,6 +48,9 @@ func (t *Logger) Writer() io.Writer {
 	return t.file
 }
 
+// Enabled returns true if tracing is active.
+func (t *Logger) Enabled() bool { return t.enabled }
+
 // Close closes the trace file.
 func (t *Logger) Close() {
 	if t.file != nil {

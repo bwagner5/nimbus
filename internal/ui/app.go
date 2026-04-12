@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -95,6 +96,13 @@ type Model struct {
 	deleteAppReg     string
 	deletedApps     map[string]time.Time      // name -> expiry
 	appFastPollUntil time.Time                // fast-poll app detail until this time
+	envOrder         []string                 // cached env order for current app
+	promoteFrom      string                   // source env for promote modal
+	promoteCursor    int                      // cursor in promote dest selection
+	promoteTargets   []string                 // available dest envs
+	addEnvInput      string                   // text input for add-env
+	addEnvActive     bool                     // true when add-env input is active
+	nextRefreshAt    time.Time                // when the next refresh tick will fire
 }
 
 func (v view) String() string {
@@ -141,9 +149,10 @@ func NewModel(logger *trace.Logger) Model {
 		loading:    true,
 		refreshing: true,
 		ctx:        ctx,
-		cancel:  cancel,
-		spinner: s,
-		trace:   logger,
+		cancel:        cancel,
+		spinner:       s,
+		trace:         logger,
+		nextRefreshAt: time.Now().Add(instances.RefreshNormal),
 	}
 }
 
@@ -194,6 +203,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pollRegion = instances.CheckPollSettled(m.resources, m.pollRegion)
 		m.applyFilter()
 		m.refreshGen++
+		d := instances.RefreshNormal
+		if m.pollRegion != "" {
+			d = instances.RefreshFast
+		}
+		m.nextRefreshAt = time.Now().Add(d)
 		return m, instances.ScheduleRefresh(m.refreshGen, m.pollRegion)
 
 	case instances.RegionsMsg:
@@ -221,6 +235,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Done || msg.Completed >= msg.Total {
 			m.loading, m.progress, m.refreshing = false, "", false
 			m.lastRefreshDone = time.Now()
+			m.refreshGen++
+			d := instances.RefreshNormal
+			if m.pollRegion != "" {
+				d = instances.RefreshFast
+			}
+			m.nextRefreshAt = time.Now().Add(d)
+			return m, instances.ScheduleRefresh(m.refreshGen, m.pollRegion)
 		}
 
 	// Create flow
@@ -399,6 +420,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, utils.ScheduleToastExpiry()
 		}
 		m.appDetail = msg.Detail
+		// Sort environments by stored order
+		if m.appDetail != nil && len(m.envOrder) > 0 {
+			orderIdx := map[string]int{}
+			for i, e := range m.envOrder {
+				orderIdx[e] = i
+			}
+			sort.SliceStable(m.appDetail.Environments, func(i, j int) bool {
+				oi, ok1 := orderIdx[m.appDetail.Environments[i].Name]
+				oj, ok2 := orderIdx[m.appDetail.Environments[j].Name]
+				if !ok1 {
+					oi = len(m.envOrder)
+				}
+				if !ok2 {
+					oj = len(m.envOrder)
+				}
+				return oi < oj
+			})
+		}
+		m.lastRefreshDone = time.Now()
 		targets := applications.AppDetailTargets(m.appDetail)
 		if m.appDetailCursor >= len(targets) {
 			m.appDetailCursor = max(0, len(targets)-1)
@@ -424,16 +464,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.deleteProgress.Complete(1)
 			m.deleteProgress.Start(2)
-			return m, applications.DeleteAppBuckets(m.ctx, m.client, m.deleteAppName, m.deleteAppReg)
+			return m, applications.CleanupAppFirewall(m.ctx, m.client, m.deleteAppName, m.deleteAppReg)
 		}
 
-	case applications.DeleteAppMsg:
+	case applications.CleanupFirewallDoneMsg:
 		if m.deleteProgress != nil {
 			if msg.Err != nil {
 				m.deleteProgress.Fail(2, msg.Err)
 				return m, nil
 			}
 			m.deleteProgress.Complete(2)
+			m.deleteProgress.Start(3)
+			return m, applications.DeleteAppBuckets(m.ctx, m.client, m.deleteAppName, m.deleteAppReg)
+		}
+
+	case applications.DeleteAppMsg:
+		if m.deleteProgress != nil {
+			if msg.Err != nil {
+				m.deleteProgress.Fail(3, msg.Err)
+				return m, nil
+			}
+			m.deleteProgress.Complete(3)
 		}
 		m.progress = ""
 		if msg.Err != nil {
@@ -492,6 +543,60 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(instances.ScheduleRefresh(m.refreshGen, "fast"), utils.ScheduleToastExpiry())
 
+	case applications.AddEnvMsg:
+		if msg.Err != nil {
+			m.toast = utils.NewToast([]string{msg.Err.Error()})
+			return m, utils.ScheduleToastExpiry()
+		}
+		m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Environment %s added", msg.EnvName)})
+		m.appFastPollUntil = time.Now().Add(2 * time.Minute)
+		m.refreshGen++
+		if m.appDetail != nil {
+			return m, tea.Batch(
+				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
+				instances.ScheduleRefresh(m.refreshGen, "fast"),
+				utils.ScheduleToastExpiry(),
+			)
+		}
+		return m, tea.Batch(instances.ScheduleRefresh(m.refreshGen, "fast"), utils.ScheduleToastExpiry())
+
+	case applications.ReorderEnvMsg:
+		if msg.Err != nil {
+			m.toast = utils.NewToast([]string{msg.Err.Error()})
+			return m, utils.ScheduleToastExpiry()
+		}
+		m.envOrder = msg.Order
+		m.toast = utils.NewSuccessToast([]string{"Environment order updated"})
+		if m.appDetail != nil {
+			return m, tea.Batch(
+				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
+				utils.ScheduleToastExpiry(),
+			)
+		}
+		return m, utils.ScheduleToastExpiry()
+
+	case applications.EnvOrderMsg:
+		if msg.Err == nil {
+			m.envOrder = msg.Order
+		}
+
+	case applications.PromoteMsg:
+		if msg.Err != nil {
+			m.toast = utils.NewToast([]string{msg.Err.Error()})
+			return m, utils.ScheduleToastExpiry()
+		}
+		m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Promoted %s → %s", msg.SrcEnv, msg.DestEnv)})
+		m.appFastPollUntil = time.Now().Add(2 * time.Minute)
+		m.refreshGen++
+		if m.appDetail != nil {
+			return m, tea.Batch(
+				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
+				instances.ScheduleRefresh(m.refreshGen, "fast"),
+				utils.ScheduleToastExpiry(),
+			)
+		}
+		return m, tea.Batch(instances.ScheduleRefresh(m.refreshGen, "fast"), utils.ScheduleToastExpiry())
+
 	// Toast / errors
 	case utils.ToastExpireMsg:
 		m.toast = utils.Toast{}
@@ -538,29 +643,26 @@ func (m Model) handleRefreshTick(msg instances.RefreshTickMsg) (tea.Model, tea.C
 	}
 	if m.refreshing {
 		m.refreshGen++
+		d := instances.RefreshFast // retry soon while waiting for in-flight request
+		m.nextRefreshAt = time.Now().Add(d)
 		return m, instances.ScheduleRefresh(m.refreshGen, m.pollRegion)
 	}
 	if since := time.Since(m.lastRefreshDone); since < instances.RefreshCooldown {
 		m.refreshGen++
 		gen := m.refreshGen
-		return m, tea.Tick(instances.RefreshCooldown-since, func(time.Time) tea.Msg {
+		wait := instances.RefreshCooldown - since
+		m.nextRefreshAt = time.Now().Add(wait)
+		return m, tea.Tick(wait, func(time.Time) tea.Msg {
 			return instances.RefreshTickMsg{Gen: gen}
 		})
 	}
 	if m.view == viewCreate {
 		m.refreshGen++
+		m.nextRefreshAt = time.Now().Add(instances.RefreshNormal)
 		return m, instances.ScheduleRefresh(m.refreshGen, m.pollRegion)
 	}
-	if m.view == viewDetail && m.detailName != "" {
-		// Refresh metrics periodically while viewing detail
-		m.refreshGen++
-		mr := instances.MetricRanges[m.metricRange]
-		return m, tea.Batch(
-			instances.FetchMetrics(m.ctx, m.client, m.detailName, m.detailRegion, mr),
-			instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
-		)
-	}
-	if m.view == viewDetail && m.appDetail != nil {
+	// App detail refresh (must come before instance detail since both set detailName)
+	if m.view == viewDetail && m.appDetail != nil && !m.appDetailFrom {
 		m.refreshGen++
 		fastPoll := time.Now().Before(m.appFastPollUntil)
 		pollHint := m.pollRegion
@@ -568,9 +670,28 @@ func (m Model) handleRefreshTick(msg instances.RefreshTickMsg) (tea.Model, tea.C
 			pollHint = "fast"
 			m.trace.Log("fastPoll: active for appDetail, remaining=%s", time.Until(m.appFastPollUntil).Truncate(time.Second))
 		}
+		d := instances.RefreshNormal
+		if pollHint != "" {
+			d = instances.RefreshFast
+		}
+		m.nextRefreshAt = time.Now().Add(d)
 		return m, tea.Batch(
 			applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
 			instances.ScheduleRefresh(m.refreshGen, pollHint),
+		)
+	}
+	// Instance detail refresh (including instance-from-app-detail)
+	if m.view == viewDetail && m.detailName != "" {
+		m.refreshGen++
+		mr := instances.MetricRanges[m.metricRange]
+		d := instances.RefreshNormal
+		if m.pollRegion != "" {
+			d = instances.RefreshFast
+		}
+		m.nextRefreshAt = time.Now().Add(d)
+		return m, tea.Batch(
+			instances.FetchMetrics(m.ctx, m.client, m.detailName, m.detailRegion, mr),
+			instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
 		)
 	}
 	m.refreshing = true
@@ -683,6 +804,32 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if m.view == viewConfirm && m.promoteFrom != "" {
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("j", "down"))):
+			if m.promoteCursor < len(m.promoteTargets)-1 {
+				m.promoteCursor++
+			}
+		case key.Matches(msg, key.NewBinding(key.WithKeys("k", "up"))):
+			if m.promoteCursor > 0 {
+				m.promoteCursor--
+			}
+		case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
+			destEnv := m.promoteTargets[m.promoteCursor]
+			srcEnv := m.promoteFrom
+			m.promoteFrom = ""
+			m.view = viewDetail
+			m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Promoting %s → %s...", srcEnv, destEnv)})
+			return m, tea.Batch(
+				applications.PromoteDeploy(m.ctx, m.client, m.appDetail.Name, srcEnv, destEnv, m.appDetail.Region),
+				utils.ScheduleToastExpiry(),
+			)
+		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+			m.promoteFrom = ""
+			m.view = viewDetail
+		}
+		return m, nil
+	}
 	if m.disassocProgress != nil && m.disassocProgress.Failed() {
 		if key.Matches(msg, key.NewBinding(key.WithKeys("esc"))) {
 			m.disassocProgress = nil
@@ -730,6 +877,32 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 		// App detail view: target selection with j/k, enter, x, d
 		if m.appDetail != nil && !m.appDetailFrom {
+			// Add-env text input mode
+			if m.addEnvActive {
+				switch {
+				case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+					m.addEnvActive = false
+					m.addEnvInput = ""
+					m.updateDetailContent()
+				case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
+					if m.addEnvInput != "" {
+						m.addEnvActive = false
+						return m, applications.AddEnv(m.ctx, m.client, m.appDetail.Name, m.addEnvInput, m.appDetail.Region)
+					}
+				case key.Matches(msg, key.NewBinding(key.WithKeys("backspace"))):
+					if len(m.addEnvInput) > 0 {
+						m.addEnvInput = m.addEnvInput[:len(m.addEnvInput)-1]
+						m.updateDetailContent()
+					}
+				default:
+					if len(msg.Text) == 1 {
+						m.addEnvInput += msg.Text
+						m.updateDetailContent()
+					}
+				}
+				return m, nil
+			}
+
 			targets := applications.AppDetailTargets(m.appDetail)
 			cur := targets[m.appDetailCursor]
 			switch {
@@ -750,6 +923,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.updateDetailContent()
 				return m, nil
 			case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
+				if cur.IsAddEnv {
+					m.addEnvActive = true
+					m.addEnvInput = ""
+					m.updateDetailContent()
+					return m, nil
+				}
 				if cur.IsAddTarget {
 					// Open add-target instance selection modal
 					m.addTargetEnv = cur.EnvName
@@ -764,6 +943,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					}
 					return m, tea.Batch(cmds...)
 				}
+				if cur.IsEnvHeader {
+					return m, nil // no-op on env header enter
+				}
 				// Navigate to instance detail
 				m.appDetailFrom = true
 				m.detail = nil
@@ -777,6 +959,45 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					instances.FetchInstanceDetail(m.ctx, m.client, cur.Target.Name, cur.Target.Region),
 					instances.FetchMetrics(m.ctx, m.client, cur.Target.Name, cur.Target.Region, mr),
 				)
+			case key.Matches(msg, key.NewBinding(key.WithKeys("J"))):
+				// Move env down in order
+				if cur.IsEnvHeader && len(m.envOrder) > 1 && cur.EnvIdx < len(m.envOrder)-1 {
+					newOrder := make([]string, len(m.envOrder))
+					copy(newOrder, m.envOrder)
+					newOrder[cur.EnvIdx], newOrder[cur.EnvIdx+1] = newOrder[cur.EnvIdx+1], newOrder[cur.EnvIdx]
+					return m, applications.ReorderEnv(m.ctx, m.client, m.appDetail.Name, m.appDetail.Region, newOrder)
+				}
+			case key.Matches(msg, key.NewBinding(key.WithKeys("K"))):
+				// Move env up in order
+				if cur.IsEnvHeader && len(m.envOrder) > 1 && cur.EnvIdx > 0 {
+					newOrder := make([]string, len(m.envOrder))
+					copy(newOrder, m.envOrder)
+					newOrder[cur.EnvIdx], newOrder[cur.EnvIdx-1] = newOrder[cur.EnvIdx-1], newOrder[cur.EnvIdx]
+					return m, applications.ReorderEnv(m.ctx, m.client, m.appDetail.Name, m.appDetail.Region, newOrder)
+				}
+			case key.Matches(msg, key.NewBinding(key.WithKeys("p"))):
+				// Promote: pick source env from cursor context
+				if m.appDetail == nil || len(m.envOrder) < 2 {
+					return m, nil
+				}
+				srcEnv := cur.EnvName
+				if cur.IsAddEnv {
+					// No env context — use first env
+					srcEnv = m.envOrder[0]
+				}
+				m.promoteFrom = srcEnv
+				m.promoteCursor = 0
+				m.promoteTargets = nil
+				for _, e := range m.envOrder {
+					if e != srcEnv {
+						m.promoteTargets = append(m.promoteTargets, e)
+					}
+				}
+				if len(m.promoteTargets) == 0 {
+					return m, nil
+				}
+				m.view = viewConfirm // reuse confirm view for modal
+				return m, nil
 			case key.Matches(msg, key.NewBinding(key.WithKeys("x"))):
 				if !cur.IsAddTarget && cur.Target.State == "running" {
 					return m, instances.FetchSSHCredentials(m.ctx, m.client, cur.Target.Name, cur.Target.Region)
@@ -810,6 +1031,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.appDetailFrom = false
 				m.detail = nil
 				m.metrics = nil
+				m.lastRefreshDone = time.Now()
 				if m.appDetail == nil {
 					m.view = viewResources
 					return m, nil
@@ -823,6 +1045,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.view = viewResources
 			m.detail = nil
 			m.metrics = nil
+			m.lastRefreshDone = time.Now()
 			return m, nil
 		case key.Matches(msg, key.NewBinding(key.WithKeys("["))):
 			if m.metricRange > 0 {
@@ -987,9 +1210,13 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 			m.detailVP = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(m.height-1))
 			m.detailVP.KeyMap.HalfPageDown.SetEnabled(false)
 			mr := instances.MetricRanges[m.metricRange]
+			m.refreshGen++
+			m.lastRefreshDone = time.Now()
+			m.nextRefreshAt = time.Now().Add(instances.RefreshNormal)
 			return m, tea.Batch(
 				instances.FetchInstanceDetail(m.ctx, m.client, r.Name(), r.Region()),
 				instances.FetchMetrics(m.ctx, m.client, r.Name(), r.Region(), mr),
+				instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
 			)
 		}
 		if kind == "lightsail/applications" {
@@ -1004,7 +1231,14 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 			if app, ok := r.(resources.LightsailApplication); ok {
 				bucketName = app.Bucket()
 			}
-			return m, applications.FetchAppDetail(m.ctx, m.client, r.Name(), bucketName, r.Region())
+			m.refreshGen++
+			m.lastRefreshDone = time.Now()
+			m.nextRefreshAt = time.Now().Add(instances.RefreshNormal)
+			return m, tea.Batch(
+				applications.FetchAppDetail(m.ctx, m.client, r.Name(), bucketName, r.Region()),
+				applications.FetchEnvOrder(m.ctx, m.client, r.Name(), r.Region()),
+				instances.ScheduleRefresh(m.refreshGen, m.pollRegion),
+			)
 		}
 	}
 	if m.view == viewRegions {
@@ -1015,6 +1249,7 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 		m.loading = true
 		m.resources = nil
 		m.filter = ""
+		m.lastRefreshDone = time.Now()
 		return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
 	}
 	if m.view == viewProviders {
@@ -1026,6 +1261,7 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 		m.loading = true
 		m.resources = nil
 		m.filter = ""
+		m.lastRefreshDone = time.Now()
 		return m, instances.FetchResources(m.ctx, m.client, m.provider(), m.region)
 	}
 	return m, nil
@@ -1136,6 +1372,9 @@ func (m *Model) updateDetailContent() {
 		content = instances.RenderInstanceDetail(m.detail, m.metrics, m.metricsLoading, m.metricRange, m.width)
 	} else if m.provider().Kind() == "lightsail/applications" && m.appDetail != nil {
 		content = applications.RenderAppDetail(m.appDetail, m.appDetailCursor, m.width)
+		if m.addEnvActive {
+			content += "\n  Environment name: " + m.addEnvInput + "█"
+		}
 	} else if m.provider().Kind() == "lightsail/applications" {
 		content = applications.RenderAppDetail(nil, 0, m.width)
 	} else {
@@ -1202,9 +1441,9 @@ func (m Model) View() tea.View {
 			if m.appDetail != nil && m.detail == nil {
 				targets := applications.AppDetailTargets(m.appDetail)
 				if len(targets) > 0 && !targets[m.appDetailCursor].IsAddTarget {
-					help = " esc:back  j/k:select  enter:detail  x:ssh  d:disassociate "
+					help = " esc:back  j/k:select  enter:detail  x:ssh  d:disassociate  J/K:reorder  p:promote "
 				} else {
-					help = " esc:back  j/k:select  enter:add/detail  x:ssh "
+					help = " esc:back  j/k:select  enter:add/detail  x:ssh  J/K:reorder  p:promote "
 				}
 			} else if m.appDetailFrom {
 				help = " esc:app detail  s:stop/start  d:delete  x:shell  [/]:range  ↑↓:scroll "
@@ -1237,6 +1476,9 @@ func (m Model) View() tea.View {
 			if m.disassocConfirm != nil {
 				base := utils.RenderWithStatusBar(m.detailVP.View(), "", m.width, m.height)
 				screen = utils.Overlay(base, applications.RenderDisassociateConfirmModal(m.disassocConfirm.Target.Name, m.disassocConfirm.EnvName), m.width, m.height)
+			} else if m.promoteFrom != "" {
+				base := utils.RenderWithStatusBar(m.detailVP.View(), "", m.width, m.height)
+				screen = utils.Overlay(base, applications.RenderPromoteModal(m.promoteFrom, m.promoteTargets, m.promoteCursor), m.width, m.height)
 			} else if m.appConfirmName != "" {
 				screen = utils.Overlay(renderBase(), applications.RenderAppConfirmModal(m.appConfirmName), m.width, m.height)
 			} else {
@@ -1250,6 +1492,34 @@ func (m Model) View() tea.View {
 			}
 		}
 	}
+	// Inject status line above the help bar: progress (left), refresh info (right)
+	{
+		left := ""
+		if m.progress != "" {
+			left = " " + m.spinner.View() + " " + m.progress
+		}
+		right := ""
+		if !m.lastRefreshDone.IsZero() {
+			ago := time.Since(m.lastRefreshDone).Truncate(time.Second)
+			right = fmt.Sprintf("Updated %s ago", ago)
+		}
+		if !m.nextRefreshAt.IsZero() {
+			remaining := time.Until(m.nextRefreshAt).Truncate(time.Second)
+			if remaining < 0 {
+				remaining = 0
+			}
+			nr := fmt.Sprintf("Next Refresh in %s", remaining)
+			if right != "" {
+				right += " │ " + nr
+			} else {
+				right = nr
+			}
+		}
+		if left != "" || right != "" {
+			screen = injectRefreshLine(screen, left, right+" ", m.width)
+		}
+	}
+
 	if m.toast.Active() {
 		lines := strings.Split(screen, "\n")
 		toast := m.toast.View(m.width)
@@ -1273,4 +1543,26 @@ func (m Model) View() tea.View {
 	v := tea.NewView(screen)
 	v.AltScreen = true
 	return v
+}
+
+// injectRefreshLine replaces the second-to-last line with a dim status line
+// showing "Updated Xs ago" on the left and optionally "next refresh: Ys" on the right.
+func injectRefreshLine(screen, left, right string, width int) string {
+	lines := strings.Split(screen, "\n")
+	if len(lines) < 2 {
+		return screen
+	}
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	idx := len(lines) - 2
+	if left == "" && right == "" {
+		return screen
+	}
+	leftStyled := dim.Render(left)
+	rightStyled := dim.Render(right)
+	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if pad < 1 {
+		pad = 1
+	}
+	lines[idx] = leftStyled + strings.Repeat(" ", pad) + rightStyled
+	return strings.Join(lines, "\n")
 }
