@@ -100,16 +100,28 @@ func appHelp() {
 			entries []cmdEntry
 		}{
 			{
-				title: "Commands",
+				title: "Resource Commands",
 				entries: []cmdEntry{
+					{"create", "Create a new application"},
 					{"list (ls)", "List applications in a region"},
-					{"deploy", "Deploy to targets (bucket upload or SSH)"},
-					{"logs", "Stream docker compose logs from a target"},
-					{"rollback", "Roll back to the previous deployment"},
-					{"promote", "Promote a deploy from one env to another"},
-					{"env", "Manage environments (add, list, reorder)"},
+					{"get", "Get application details"},
 					{"delete (rm)", "Delete an application and its resources"},
+				},
+			},
+			{
+				title: "Actions",
+				entries: []cmdEntry{
+					{"deploy", "Deploy to targets (bucket upload or SSH)"},
+					{"promote", "Promote a deploy from one env to another"},
+					{"rollback", "Roll back to the previous deployment"},
+					{"logs", "Stream docker compose logs from a target"},
 					{"disassociate", "Remove an instance as a deployment target"},
+				},
+			},
+			{
+				title: "Subresources",
+				entries: []cmdEntry{
+					{"env", "Manage environments (add, list, get, delete, reorder, promote)"},
 				},
 			},
 			{
@@ -249,8 +261,12 @@ func handleApplication(args []string) {
 	}
 
 	switch args[0] {
+	case "create":
+		handleCreate(args[1:])
 	case "list", "ls":
 		handleList(args[1:])
+	case "get":
+		handleGet(args[1:])
 	case "deploy":
 		handleDeploy(args[1:])
 	case "rollback":
@@ -299,10 +315,106 @@ func handleList(args []string) {
 		return
 	}
 
-	fmt.Printf("%-20s %-10s %-40s %s\n", "NAME", "STATE", "BUCKET", "REGION")
+	fmt.Printf("%-20s %-10s %-15s %-40s %s\n", "NAME", "STATE", "ENVS", "BUCKET", "REGION")
 	for _, a := range apps {
 		vals := a.Values()
-		fmt.Printf("%-20s %-10s %-40s %s\n", vals[0], vals[1], vals[2], vals[3])
+		fmt.Printf("%-20s %-10s %-15s %-40s %s\n", vals[0], vals[1], vals[2], vals[3], vals[4])
+	}
+}
+
+func handleCreate(args []string) {
+	fs := flag.NewFlagSet("nimbus app create", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "dev", "Initial environment name")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app create — create a new application", "Create a new application with an initial environment bucket.\nIf --name is omitted, prompts for input.")
+	fs.Parse(args)
+
+	if *name == "" {
+		*name = promptInput("Application name:")
+	}
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "Error: application name is required")
+		os.Exit(1)
+	}
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	appClient := applications.NewClient(client)
+	accountID, err := appClient.AccountID(ctx)
+	if err != nil {
+		fatal(err)
+	}
+
+	fmt.Printf("Creating application %s with environment %s...\n", *name, *env)
+	if err := appClient.CreateAppBucket(ctx, accountID, *name, r); err != nil {
+		fatal(err)
+	}
+	if err := appClient.Create(ctx, accountID, *name, *env, r); err != nil {
+		fatal(err)
+	}
+	if err := appClient.SetEnvOrder(ctx, *name, r, []string{*env}); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("✅ Created application %s (env: %s)\n", *name, *env)
+}
+
+func handleGet(args []string) {
+	fs := flag.NewFlagSet("nimbus app get", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app get — get application details", "Show detailed information about an application including environments and targets.\nIf --name is omitted, prompts for selection.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	detail, err := applications.NewClient(client).GetDetail(ctx, app.Name, app.Bucket, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	fmt.Printf("Name:    %s\n", detail.Name)
+	fmt.Printf("State:   %s\n", detail.State)
+	fmt.Printf("Region:  %s\n", detail.Region)
+	fmt.Printf("Bucket:  %s\n", detail.Bucket)
+	fmt.Println()
+
+	if len(detail.Environments) == 0 {
+		fmt.Println("No environments configured")
+		return
+	}
+
+	for _, env := range detail.Environments {
+		fmt.Printf("Environment: %s\n", env.Name)
+		fmt.Printf("  Bucket: %s\n", env.Bucket)
+		if len(env.Targets) == 0 {
+			fmt.Println("  Targets: none")
+		} else {
+			fmt.Printf("  %-24s %-10s %s\n", "  TARGET", "STATE", "IP")
+			for _, t := range env.Targets {
+				fmt.Printf("  %-24s %-10s %s\n", "  "+t.Name, t.State, t.IP)
+			}
+		}
+		fmt.Println()
 	}
 }
 
@@ -325,14 +437,15 @@ func handleDeploy(args []string) {
 	}
 
 	if *useSSH {
-		if *name == "" {
-			fmt.Fprintln(os.Stderr, "Error: --name is required for SSH deploy")
-			os.Exit(1)
+		app, err := selectApp(ctx, client, *name, r)
+		if err != nil {
+			fatal(err)
 		}
-		if *env == "" {
-			*env = "dev"
+		envName := selectEnv(app, *env)
+		if envName == "" {
+			envName = "dev"
 		}
-		if err := deploy.Deploy(ctx, client, *name, *env, r); err != nil {
+		if err := deploy.Deploy(ctx, client, app.Name, envName, r); err != nil {
 			fatal(err)
 		}
 	} else {
@@ -400,7 +513,7 @@ func handleDelete(args []string) {
 
 func handleWatch(args []string) {
 	fs := flag.NewFlagSet("nimbus app local watch", flag.ExitOnError)
-	name := fs.String("name", "", "Application name (required)")
+	name := fs.String("name", "", "Application name")
 	env := fs.String("env", "dev", "Environment name")
 	region := fs.String("region", "", "AWS region (defaults to AWS_REGION or us-east-1)")
 	interval := fs.Duration("interval", 10*time.Second, "Poll interval")
@@ -409,8 +522,10 @@ func handleWatch(args []string) {
 	fs.Parse(args)
 
 	if *name == "" {
-		fmt.Fprintln(os.Stderr, "Error: --name is required")
-		fs.Usage()
+		*name = promptInput("Application name:")
+	}
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "Error: application name is required")
 		os.Exit(1)
 	}
 
@@ -425,15 +540,20 @@ func handleWatch(args []string) {
 
 func handleUp(args []string) {
 	fs := flag.NewFlagSet("nimbus app local up", flag.ExitOnError)
-	name := fs.String("name", "", "Application name (required)")
-	env := fs.String("env", "dev", "Environment name")
-	flagHelp(fs, "nimbus app local up — start watching for deployments", "Create the app/env directory and install a systemd service that watches for new deployments.")
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "Environment name")
+	flagHelp(fs, "nimbus app local up — start watching for deployments", "Create the app/env directory and install a systemd service that watches for new deployments.\nIf --name is omitted, prompts for input.")
 	fs.Parse(args)
 
 	if *name == "" {
-		fmt.Fprintln(os.Stderr, "Error: --name is required")
-		fs.Usage()
+		*name = promptInput("Application name:")
+	}
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "Error: application name is required")
 		os.Exit(1)
+	}
+	if *env == "" {
+		*env = "dev"
 	}
 
 	fmt.Printf("Starting %s/%s...\n", *name, *env)
@@ -509,15 +629,27 @@ func handleLocalList(args []string) {
 
 func handleDown(args []string) {
 	fs := flag.NewFlagSet("nimbus app local down", flag.ExitOnError)
-	name := fs.String("name", "", "Application name (required)")
-	env := fs.String("env", "dev", "Environment name")
-	flagHelp(fs, "nimbus app local down — stop and clean up a deployment", "Stop running containers, uninstall the watch service, and remove the app/env directory.")
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "Environment name")
+	flagHelp(fs, "nimbus app local down — stop and clean up a deployment", "Stop running containers, uninstall the watch service, and remove the app/env directory.\nIf --name is omitted, prompts for selection from local deployments.")
 	fs.Parse(args)
 
 	if *name == "" {
-		fmt.Fprintln(os.Stderr, "Error: --name is required")
-		fs.Usage()
-		os.Exit(1)
+		envs, err := applications.LocalList()
+		if err != nil || len(envs) == 0 {
+			fmt.Fprintln(os.Stderr, "No local deployments found")
+			os.Exit(1)
+		}
+		items := make([]string, len(envs))
+		for i, e := range envs {
+			items[i] = fmt.Sprintf("%s/%s", e.App, e.Env)
+		}
+		idx := promptSelect("Select deployment", items)
+		*name = envs[idx].App
+		*env = envs[idx].Env
+	}
+	if *env == "" {
+		*env = "dev"
 	}
 
 	fmt.Printf("Stopping %s/%s...\n", *name, *env)
@@ -569,20 +701,39 @@ func handleEnv(args []string) {
 		printHelp("nimbus app env — manage environments", []struct {
 			title   string
 			entries []cmdEntry
-		}{{title: "Commands", entries: []cmdEntry{
-			{"add", "Add a new environment to an application"},
-			{"list (ls)", "List environments in order"},
-			{"reorder", "Set environment order"},
-		}}}, "")
+		}{
+			{
+				title: "Resource Commands",
+				entries: []cmdEntry{
+					{"add", "Add a new environment to an application"},
+					{"list (ls)", "List environments in order"},
+					{"get", "Get environment details"},
+					{"delete (rm)", "Delete an environment"},
+				},
+			},
+			{
+				title: "Actions",
+				entries: []cmdEntry{
+					{"reorder", "Set environment order"},
+					{"promote", "Promote a deploy from one env to another"},
+				},
+			},
+		}, "")
 		return
 	}
 	switch args[0] {
-	case "add":
+	case "add", "create":
 		handleEnvAdd(args[1:])
 	case "list", "ls":
 		handleEnvList(args[1:])
+	case "get":
+		handleEnvGet(args[1:])
+	case "delete", "rm":
+		handleEnvDelete(args[1:])
 	case "reorder":
 		handleEnvReorder(args[1:])
+	case "promote":
+		handleEnvPromote(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: nimbus app env %s\n", args[0])
 		os.Exit(1)
@@ -613,8 +764,7 @@ func handleEnvAdd(args []string) {
 
 	envName := *env
 	if envName == "" {
-		fmt.Fprintf(os.Stderr, "Environment name: ")
-		fmt.Scan(&envName)
+		envName = promptInput("Environment name:")
 	}
 	if envName == "" {
 		fmt.Fprintln(os.Stderr, "Error: environment name is required")
@@ -632,7 +782,7 @@ func handleEnvList(args []string) {
 	fs := flag.NewFlagSet("nimbus app env list", flag.ExitOnError)
 	name := fs.String("name", "", "Application name")
 	region := fs.String("region", "", "AWS region")
-	flagHelp(fs, "nimbus app env list — list environments in order", "Show the environment pipeline order for an application.")
+	flagHelp(fs, "nimbus app env list — list environments in order", "Show the environment pipeline order for an application.\nIf --name is omitted, prompts for selection.")
 	fs.Parse(args)
 
 	r := resolveRegion(*region)
@@ -649,16 +799,17 @@ func handleEnvList(args []string) {
 		fatal(err)
 	}
 
-	order, err := applications.NewClient(client).GetEnvOrder(ctx, app.Name, r)
+	detail, err := applications.NewClient(client).GetDetail(ctx, app.Name, app.Bucket, r)
 	if err != nil {
 		fatal(err)
 	}
-	if len(order) == 0 {
+	if len(detail.Environments) == 0 {
 		fmt.Println("No environments found")
 		return
 	}
-	for i, e := range order {
-		fmt.Printf("  %d. %s\n", i+1, e)
+	fmt.Printf("%-5s %-15s %-40s %s\n", "ORDER", "ENV", "BUCKET", "TARGETS")
+	for i, env := range detail.Environments {
+		fmt.Printf("%-5d %-15s %-40s %d\n", i+1, env.Name, env.Bucket, len(env.Targets))
 	}
 }
 
@@ -697,9 +848,7 @@ func handleEnvReorder(args []string) {
 		for i, e := range current {
 			fmt.Printf("  %d. %s\n", i+1, e)
 		}
-		fmt.Fprintf(os.Stderr, "New order (comma-separated): ")
-		var input string
-		fmt.Scan(&input)
+		input := promptInput("New order (comma-separated):")
 		newOrder = strings.Split(input, ",")
 	}
 
@@ -712,6 +861,145 @@ func handleEnvReorder(args []string) {
 		fatal(err)
 	}
 	fmt.Println("✅ Environment order updated")
+}
+
+func handleEnvGet(args []string) {
+	fs := flag.NewFlagSet("nimbus app env get", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "Environment name")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app env get — get environment details", "Show details for a specific environment including targets.\nIf flags are omitted, prompts for selection.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	detail, err := applications.NewClient(client).GetDetail(ctx, app.Name, app.Bucket, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	envName := selectEnv(app, *env)
+	var found *applications.Environment
+	for i := range detail.Environments {
+		if detail.Environments[i].Name == envName {
+			found = &detail.Environments[i]
+			break
+		}
+	}
+	if found == nil {
+		fatal(fmt.Errorf("environment %q not found", envName))
+	}
+
+	fmt.Printf("Environment: %s\n", found.Name)
+	fmt.Printf("Bucket:      %s\n", found.Bucket)
+	fmt.Printf("Targets:     %d\n", len(found.Targets))
+	fmt.Println()
+	if len(found.Targets) > 0 {
+		fmt.Printf("%-24s %-10s %s\n", "TARGET", "STATE", "IP")
+		for _, t := range found.Targets {
+			fmt.Printf("%-24s %-10s %s\n", t.Name, t.State, t.IP)
+		}
+	}
+}
+
+func handleEnvDelete(args []string) {
+	fs := flag.NewFlagSet("nimbus app env delete", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "Environment name")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app env delete — delete an environment", "Remove an environment and its bucket.\nIf flags are omitted, prompts for selection.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+	envName := selectEnv(app, *env)
+
+	fmt.Printf("Deleting environment %s from %s...\n", envName, app.Name)
+	if err := applications.NewClient(client).DeleteEnvironment(ctx, app.Name, envName, r); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("✅ Deleted environment %s\n", envName)
+}
+
+func handleEnvPromote(args []string) {
+	fs := flag.NewFlagSet("nimbus app env promote", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	from := fs.String("from", "", "Source environment")
+	to := fs.String("to", "", "Destination environment")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app env promote — promote a deploy between environments", "Copy the latest deploy asset from one environment to another.\nIf flags are omitted, prompts for selection.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	appClient := applications.NewClient(client)
+	order, err := appClient.GetEnvOrder(ctx, app.Name, r)
+	if err != nil {
+		fatal(err)
+	}
+	if len(order) < 2 {
+		fatal(fmt.Errorf("need at least 2 environments to promote, found %d", len(order)))
+	}
+
+	srcEnv := *from
+	if srcEnv == "" {
+		idx := promptSelect("Source environment", order)
+		srcEnv = order[idx]
+	}
+
+	destEnv := *to
+	if destEnv == "" {
+		var destOptions []string
+		for _, e := range order {
+			if e != srcEnv {
+				destOptions = append(destOptions, e)
+			}
+		}
+		if len(destOptions) == 0 {
+			fatal(fmt.Errorf("no destination environments available"))
+		}
+		idx := promptSelect("Destination environment", destOptions)
+		destEnv = destOptions[idx]
+	}
+
+	if err := deploy.Promote(ctx, client, app.Name, srcEnv, destEnv, r); err != nil {
+		fatal(err)
+	}
 }
 
 func handlePromote(args []string) {
