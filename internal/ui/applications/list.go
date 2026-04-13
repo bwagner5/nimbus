@@ -38,7 +38,7 @@ func RenderApplications(provider resources.Provider, filtered []resources.Resour
 	}
 
 	content := b.String()
-	help := " q:quit  /:filter  ::resources  r:regions  enter:details  c:create  d:delete  R:refresh  j/k:navigate "
+	help := " q:quit  /:filter  ::resources  r:regions  enter:details  c:create  d:delete  l:logs  R:refresh  j/k:navigate "
 
 	return utils.RenderWithStatusBar(content, help, width, height)
 }

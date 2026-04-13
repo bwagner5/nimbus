@@ -245,3 +245,18 @@ func RenderPromoteModal(srcEnv string, destEnvs []string, cursor int) string {
 	b.WriteString("\n" + utils.HelpStyle.Render(" enter:promote  esc:cancel "))
 	return b.String()
 }
+
+// RenderLogsEnvModal renders the environment selection modal for logs.
+func RenderLogsEnvModal(appName string, envs []string, cursor int) string {
+	var b strings.Builder
+	b.WriteString(utils.TitleStyle.Render(fmt.Sprintf(" Logs for %s — select environment ", appName)) + "\n\n")
+	for i, e := range envs {
+		if i == cursor {
+			b.WriteString(utils.SelectedStyle.Render(fmt.Sprintf(" > %s ", e)) + "\n")
+		} else {
+			b.WriteString(fmt.Sprintf("   %s\n", e))
+		}
+	}
+	b.WriteString("\n" + utils.HelpStyle.Render(" enter:select  esc:cancel "))
+	return b.String()
+}

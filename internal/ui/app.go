@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -26,6 +27,9 @@ import (
 
 type appCreateDoneMsg struct{}
 type deleteProgressDoneMsg struct{}
+type addEnvProgressDoneMsg struct{}
+type deleteEnvProgressDoneMsg struct{}
+type promoteProgressDoneMsg struct{}
 type disassocDoneMsg struct{}
 type view int
 
@@ -102,6 +106,19 @@ type Model struct {
 	promoteTargets   []string                 // available dest envs
 	addEnvInput      string                   // text input for add-env
 	addEnvActive     bool                     // true when add-env input is active
+	addEnvProgress   *utils.StepProgress      // step progress for add-env
+	addEnvName       string                   // env name being added
+	addEnvRegion     string                   // region for add-env
+	reorderingEnvs   bool                     // true while env reorder is in flight
+	deleteEnvConfirm string                   // env name pending delete confirmation
+	deleteEnvProgress *utils.StepProgress     // step progress for env deletion
+	deleteEnvName    string                   // env being deleted
+	promoteProgress  *utils.StepProgress     // step progress for promote
+	promoteDestEnv   string                   // dest env for promote in progress
+	logsEnvSelect    []string                 // env options for logs env selector
+	logsEnvCursor    int                      // cursor in logs env selector
+	logsAppName      string                   // app name for pending logs
+	logsAppRegion    string                   // region for pending logs
 	nextRefreshAt    time.Time                // when the next refresh tick will fire
 }
 
@@ -340,6 +357,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case applications.LogsExitMsg:
+		if msg.Err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(msg.Err, &exitErr) && exitErr.ExitCode() == 130 {
+				// Normal Ctrl+C
+			} else {
+				m.toast = utils.NewToast([]string{msg.Err.Error()})
+				return m, utils.ScheduleToastExpiry()
+			}
+		}
+
+	case applications.ExecLogsMsg:
+		keyPath := msg.KeyPath
+		return m, tea.ExecProcess(msg.Cmd, func(err error) tea.Msg {
+			os.Remove(keyPath)
+			os.Remove(keyPath + "-cert.pub")
+			return applications.LogsExitMsg{Err: err}
+		})
+
+	case logsEnvListMsg:
+		if msg.Err != nil || len(msg.Envs) == 0 {
+			m.toast = utils.NewToast([]string{"No environments found"})
+			return m, utils.ScheduleToastExpiry()
+		}
+		if len(msg.Envs) == 1 {
+			m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Connecting to %s/%s...", m.logsAppName, msg.Envs[0])})
+			return m, applications.LogsExecCmd(m.ctx, m.client, m.logsAppName, msg.Envs[0], m.logsAppRegion)
+		}
+		m.logsEnvSelect = msg.Envs
+		m.logsEnvCursor = 0
+		m.view = viewConfirm
+		return m, nil
+
 	// Refresh tick
 	case instances.RefreshTickMsg:
 		m.trace.Log("msg=RefreshTick gen=%d current=%d refreshing=%v pollRegion=%q", msg.Gen, m.refreshGen, m.refreshing, m.pollRegion)
@@ -405,6 +455,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case deleteProgressDoneMsg:
 		m.deleteProgress = nil
+
+	case addEnvProgressDoneMsg:
+		m.addEnvProgress = nil
+
+	case deleteEnvProgressDoneMsg:
+		m.deleteEnvProgress = nil
+
+	case promoteProgressDoneMsg:
+		m.promoteProgress = nil
+
+	case applications.DeleteEnvDisassocMsg:
+		if m.deleteEnvProgress != nil {
+			m.deleteEnvProgress.Complete(0)
+			m.deleteEnvProgress.Start(1)
+			return m, applications.DeleteEnvBucket(m.ctx, m.client, m.appDetail.Name, msg.EnvName, m.appDetail.Region)
+		}
+
+	case applications.DeleteEnvBucketMsg:
+		if m.deleteEnvProgress != nil {
+			if msg.Err != nil {
+				m.deleteEnvProgress.Fail(1, msg.Err)
+				return m, nil
+			}
+			m.deleteEnvProgress.Complete(1)
+			m.deleteEnvProgress.Start(2)
+			return m, applications.DeleteEnvUpdateOrder(m.ctx, m.client, m.appDetail.Name, msg.EnvName, m.appDetail.Region)
+		}
+
+	case applications.DeleteEnvDoneMsg:
+		if m.deleteEnvProgress != nil {
+			if msg.Err != nil {
+				m.deleteEnvProgress.Fail(2, msg.Err)
+				return m, nil
+			}
+			m.deleteEnvProgress.Complete(2)
+		}
+		m.appFastPollUntil = time.Now().Add(2 * time.Minute)
+		m.refreshGen++
+		cmds := []tea.Cmd{
+			tea.Tick(2*time.Second, func(time.Time) tea.Msg { return deleteEnvProgressDoneMsg{} }),
+			instances.ScheduleRefresh(m.refreshGen, "fast"),
+		}
+		if m.appDetail != nil {
+			cmds = append(cmds, applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region))
+		}
+		return m, tea.Batch(cmds...)
 
 	case disassocDoneMsg:
 		m.disassocProgress = nil
@@ -543,24 +639,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(instances.ScheduleRefresh(m.refreshGen, "fast"), utils.ScheduleToastExpiry())
 
-	case applications.AddEnvMsg:
-		if msg.Err != nil {
-			m.toast = utils.NewToast([]string{msg.Err.Error()})
-			return m, utils.ScheduleToastExpiry()
+	case applications.AddEnvBucketMsg:
+		if m.addEnvProgress != nil {
+			if msg.Err != nil {
+				m.addEnvProgress.Fail(0, msg.Err)
+				return m, nil
+			}
+			m.addEnvProgress.Complete(0)
+			m.addEnvProgress.Start(1)
+			return m, applications.AddEnvUpdateOrder(m.ctx, m.client, msg.AppName, msg.EnvName, m.addEnvRegion)
 		}
-		m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Environment %s added", msg.EnvName)})
+
+	case applications.AddEnvMsg:
+		if m.addEnvProgress != nil {
+			if msg.Err != nil {
+				m.addEnvProgress.Fail(1, msg.Err)
+				return m, nil
+			}
+			m.addEnvProgress.Complete(1)
+		}
 		m.appFastPollUntil = time.Now().Add(2 * time.Minute)
 		m.refreshGen++
-		if m.appDetail != nil {
-			return m, tea.Batch(
-				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
-				instances.ScheduleRefresh(m.refreshGen, "fast"),
-				utils.ScheduleToastExpiry(),
-			)
+		// Auto-dismiss and refresh after a short delay
+		cmds := []tea.Cmd{
+			tea.Tick(2*time.Second, func(time.Time) tea.Msg { return addEnvProgressDoneMsg{} }),
+			instances.ScheduleRefresh(m.refreshGen, "fast"),
 		}
-		return m, tea.Batch(instances.ScheduleRefresh(m.refreshGen, "fast"), utils.ScheduleToastExpiry())
+		if m.appDetail != nil {
+			cmds = append(cmds, applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region))
+		}
+		return m, tea.Batch(cmds...)
 
 	case applications.ReorderEnvMsg:
+		m.reorderingEnvs = false
 		if msg.Err != nil {
 			m.toast = utils.NewToast([]string{msg.Err.Error()})
 			return m, utils.ScheduleToastExpiry()
@@ -580,22 +691,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.envOrder = msg.Order
 		}
 
-	case applications.PromoteMsg:
-		if msg.Err != nil {
-			m.toast = utils.NewToast([]string{msg.Err.Error()})
-			return m, utils.ScheduleToastExpiry()
+	case applications.PromoteDownloadMsg:
+		if m.promoteProgress != nil {
+			if msg.Err != nil {
+				m.promoteProgress.Fail(0, msg.Err)
+				return m, nil
+			}
+			m.promoteProgress.Complete(0)
+			m.promoteProgress.Start(1)
+			return m, applications.PromoteUpload(m.ctx, m.client, m.appDetail.Name, m.promoteDestEnv, m.appDetail.Region, msg.Result)
 		}
-		m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Promoted %s → %s", msg.SrcEnv, msg.DestEnv)})
+
+	case applications.PromoteMsg:
+		if m.promoteProgress != nil {
+			if msg.Err != nil {
+				m.promoteProgress.Fail(1, msg.Err)
+				return m, nil
+			}
+			m.promoteProgress.Complete(1)
+		}
 		m.appFastPollUntil = time.Now().Add(2 * time.Minute)
 		m.refreshGen++
-		if m.appDetail != nil {
-			return m, tea.Batch(
-				applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region),
-				instances.ScheduleRefresh(m.refreshGen, "fast"),
-				utils.ScheduleToastExpiry(),
-			)
+		cmds := []tea.Cmd{
+			tea.Tick(2*time.Second, func(time.Time) tea.Msg { return promoteProgressDoneMsg{} }),
+			instances.ScheduleRefresh(m.refreshGen, "fast"),
 		}
-		return m, tea.Batch(instances.ScheduleRefresh(m.refreshGen, "fast"), utils.ScheduleToastExpiry())
+		if m.appDetail != nil {
+			cmds = append(cmds, applications.FetchAppDetail(m.ctx, m.client, m.appDetail.Name, m.appDetail.Bucket, m.appDetail.Region))
+		}
+		return m, tea.Batch(cmds...)
 
 	// Toast / errors
 	case utils.ToastExpireMsg:
@@ -781,6 +905,24 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.view == viewConfirm && m.deleteEnvConfirm != "" {
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("y"))):
+			envName := m.deleteEnvConfirm
+			m.deleteEnvConfirm = ""
+			m.deleteEnvName = envName
+			steps := applications.DeleteEnvSteps(envName)
+			m.deleteEnvProgress = utils.NewStepProgress(fmt.Sprintf("Deleting environment %s", envName), steps...)
+			m.deleteEnvProgress.Start(0)
+			m.view = viewDetail
+			return m, applications.DeleteEnvDisassocTargets(m.ctx, m.client, m.appDetail.Name, envName, m.appDetail.Region)
+		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
+			m.deleteEnvConfirm = ""
+			m.view = viewDetail
+		}
+		return m, nil
+	}
+
 	if m.view == viewConfirm && m.disassocConfirm != nil {
 		switch {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("y"))):
@@ -804,6 +946,30 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if m.view == viewConfirm && len(m.logsEnvSelect) > 0 {
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("j", "down"))):
+			if m.logsEnvCursor < len(m.logsEnvSelect)-1 {
+				m.logsEnvCursor++
+			}
+		case key.Matches(msg, key.NewBinding(key.WithKeys("k", "up"))):
+			if m.logsEnvCursor > 0 {
+				m.logsEnvCursor--
+			}
+		case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
+			envName := m.logsEnvSelect[m.logsEnvCursor]
+			appName := m.logsAppName
+			region := m.logsAppRegion
+			m.logsEnvSelect = nil
+			m.view = viewResources
+			m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Connecting to %s/%s...", appName, envName)})
+			return m, applications.LogsExecCmd(m.ctx, m.client, appName, envName, region)
+		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+			m.logsEnvSelect = nil
+			m.view = viewResources
+		}
+		return m, nil
+	}
 	if m.view == viewConfirm && m.promoteFrom != "" {
 		switch {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("j", "down"))):
@@ -818,12 +984,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			destEnv := m.promoteTargets[m.promoteCursor]
 			srcEnv := m.promoteFrom
 			m.promoteFrom = ""
+			m.promoteDestEnv = destEnv
+			steps := applications.PromoteSteps(srcEnv, destEnv)
+			m.promoteProgress = utils.NewStepProgress(fmt.Sprintf("Promoting %s → %s", srcEnv, destEnv), steps...)
+			m.promoteProgress.Start(0)
 			m.view = viewDetail
-			m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Promoting %s → %s...", srcEnv, destEnv)})
-			return m, tea.Batch(
-				applications.PromoteDeploy(m.ctx, m.client, m.appDetail.Name, srcEnv, destEnv, m.appDetail.Region),
-				utils.ScheduleToastExpiry(),
-			)
+			return m, applications.PromoteDownload(m.ctx, m.client, m.appDetail.Name, srcEnv, m.appDetail.Region)
 		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
 			m.promoteFrom = ""
 			m.view = viewDetail
@@ -886,8 +1052,16 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					m.updateDetailContent()
 				case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
 					if m.addEnvInput != "" {
+						envName := m.addEnvInput
 						m.addEnvActive = false
-						return m, applications.AddEnv(m.ctx, m.client, m.appDetail.Name, m.addEnvInput, m.appDetail.Region)
+						m.addEnvInput = ""
+						m.addEnvName = envName
+						m.addEnvRegion = m.appDetail.Region
+						steps := applications.AddEnvSteps(envName)
+						m.addEnvProgress = utils.NewStepProgress(fmt.Sprintf("Adding environment %s", envName), steps...)
+						m.addEnvProgress.Start(0)
+						m.updateDetailContent()
+						return m, applications.AddEnvCreateBucket(m.ctx, m.client, m.appDetail.Name, envName, m.appDetail.Region)
 					}
 				case key.Matches(msg, key.NewBinding(key.WithKeys("backspace"))):
 					if len(m.addEnvInput) > 0 {
@@ -904,9 +1078,31 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 
 			targets := applications.AppDetailTargets(m.appDetail)
+			if len(targets) == 0 {
+				return m, nil
+			}
+			if m.appDetailCursor >= len(targets) {
+				m.appDetailCursor = max(0, len(targets)-1)
+			}
 			cur := targets[m.appDetailCursor]
 			switch {
 			case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+				// Dismiss any active overlay before navigating back
+				if m.promoteProgress != nil {
+					m.promoteProgress = nil
+					return m, nil
+				}
+				if m.deleteEnvProgress != nil {
+					m.deleteEnvProgress = nil
+					return m, nil
+				}
+				if m.disassocProgress != nil {
+					m.disassocProgress = nil
+					return m, nil
+				}
+				if m.reorderingEnvs {
+					return m, nil
+				}
 				m.view = viewResources
 				m.appDetail = nil
 				return m, nil
@@ -959,20 +1155,22 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					instances.FetchInstanceDetail(m.ctx, m.client, cur.Target.Name, cur.Target.Region),
 					instances.FetchMetrics(m.ctx, m.client, cur.Target.Name, cur.Target.Region, mr),
 				)
-			case key.Matches(msg, key.NewBinding(key.WithKeys("J"))):
+			case key.Matches(msg, key.NewBinding(key.WithKeys(">"))):
 				// Move env down in order
-				if cur.IsEnvHeader && len(m.envOrder) > 1 && cur.EnvIdx < len(m.envOrder)-1 {
+				if !m.reorderingEnvs && cur.IsEnvHeader && len(m.envOrder) > 1 && cur.EnvIdx < len(m.envOrder)-1 {
 					newOrder := make([]string, len(m.envOrder))
 					copy(newOrder, m.envOrder)
 					newOrder[cur.EnvIdx], newOrder[cur.EnvIdx+1] = newOrder[cur.EnvIdx+1], newOrder[cur.EnvIdx]
+					m.reorderingEnvs = true
 					return m, applications.ReorderEnv(m.ctx, m.client, m.appDetail.Name, m.appDetail.Region, newOrder)
 				}
-			case key.Matches(msg, key.NewBinding(key.WithKeys("K"))):
+			case key.Matches(msg, key.NewBinding(key.WithKeys("<"))):
 				// Move env up in order
-				if cur.IsEnvHeader && len(m.envOrder) > 1 && cur.EnvIdx > 0 {
+				if !m.reorderingEnvs && cur.IsEnvHeader && len(m.envOrder) > 1 && cur.EnvIdx > 0 {
 					newOrder := make([]string, len(m.envOrder))
 					copy(newOrder, m.envOrder)
 					newOrder[cur.EnvIdx], newOrder[cur.EnvIdx-1] = newOrder[cur.EnvIdx-1], newOrder[cur.EnvIdx]
+					m.reorderingEnvs = true
 					return m, applications.ReorderEnv(m.ctx, m.client, m.appDetail.Name, m.appDetail.Region, newOrder)
 				}
 			case key.Matches(msg, key.NewBinding(key.WithKeys("p"))):
@@ -998,12 +1196,34 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				}
 				m.view = viewConfirm // reuse confirm view for modal
 				return m, nil
+			case key.Matches(msg, key.NewBinding(key.WithKeys("l"))):
+				// Logs: stream docker compose logs for the env under cursor
+				if m.appDetail == nil {
+					return m, nil
+				}
+				envName := cur.EnvName
+				if cur.IsAddEnv {
+					if len(m.appDetail.Environments) == 1 {
+						envName = m.appDetail.Environments[0].Name
+					} else {
+						return m, nil
+					}
+				}
+				if envName == "" {
+					return m, nil
+				}
+				m.toast = utils.NewSuccessToast([]string{fmt.Sprintf("Connecting to %s/%s...", m.appDetail.Name, envName)})
+				return m, applications.LogsExecCmd(m.ctx, m.client, m.appDetail.Name, envName, m.appDetail.Region)
 			case key.Matches(msg, key.NewBinding(key.WithKeys("x"))):
 				if !cur.IsAddTarget && cur.Target.State == "running" {
 					return m, instances.FetchSSHCredentials(m.ctx, m.client, cur.Target.Name, cur.Target.Region)
 				}
 			case key.Matches(msg, key.NewBinding(key.WithKeys("d"))):
-				if !cur.IsAddTarget {
+				if cur.IsEnvHeader {
+					m.deleteEnvConfirm = cur.EnvName
+					m.view = viewConfirm
+					return m, nil
+				} else if !cur.IsAddTarget && !cur.IsAddEnv {
 					m.disassocConfirm = &cur
 					m.view = viewConfirm
 					return m, nil
@@ -1138,6 +1358,18 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.deleteProgress = nil
 			return m, nil
 		}
+		if m.addEnvProgress != nil && m.addEnvProgress.Failed() {
+			m.addEnvProgress = nil
+			return m, nil
+		}
+		if m.deleteEnvProgress != nil && m.deleteEnvProgress.Failed() {
+			m.deleteEnvProgress = nil
+			return m, nil
+		}
+		if m.promoteProgress != nil && m.promoteProgress.Failed() {
+			m.promoteProgress = nil
+			return m, nil
+		}
 		m.view = viewResources
 		m.filter = ""
 		m.applyFilter()
@@ -1171,8 +1403,46 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("x"))):
 		return m.handleShellKey()
+
+	case key.Matches(msg, key.NewBinding(key.WithKeys("l"))):
+		return m.handleLogsKey()
 	}
 	return m, nil
+}
+
+type logsEnvListMsg struct {
+	Err  error
+	Envs []string
+}
+
+func (m Model) handleLogsKey() (tea.Model, tea.Cmd) {
+	if m.view != viewResources || m.provider().Kind() != "lightsail/applications" {
+		return m, nil
+	}
+	if m.cursor >= len(m.filtered) {
+		return m, nil
+	}
+	r := m.filtered[m.cursor]
+	region := r.Region()
+	appName := r.Name()
+	bucketName := r.Values()[2]
+
+	// Fetch detail async to discover envs, then show selector or stream directly
+	m.logsAppName = appName
+	m.logsAppRegion = region
+	m.toast = utils.NewSuccessToast([]string{"Loading environments..."})
+	return m, func() tea.Msg {
+		appClient := appsdk.NewClient(m.client)
+		detail, err := appClient.GetDetail(m.ctx, appName, bucketName, region)
+		if err != nil || detail == nil {
+			return logsEnvListMsg{Err: fmt.Errorf("no environments found")}
+		}
+		var envs []string
+		for _, e := range detail.Environments {
+			envs = append(envs, e.Name)
+		}
+		return logsEnvListMsg{Envs: envs}
+	}
 }
 
 func (m Model) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1200,6 +1470,9 @@ func (m Model) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 	if m.view == viewResources && len(m.filtered) > 0 {
 		kind := m.provider().Kind()
+		if m.cursor >= len(m.filtered) {
+			return m, nil
+		}
 		r := m.filtered[m.cursor]
 		if kind == "lightsail/instances" {
 			m.view = viewDetail
@@ -1322,7 +1595,7 @@ func (m Model) handleCreateKey() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleStopStartKey() (tea.Model, tea.Cmd) {
-	if m.view != viewResources || m.provider().Kind() != "lightsail/instances" || len(m.filtered) == 0 {
+	if m.view != viewResources || m.provider().Kind() != "lightsail/instances" || m.cursor >= len(m.filtered) {
 		return m, nil
 	}
 	r := m.filtered[m.cursor]
@@ -1336,7 +1609,7 @@ func (m Model) handleStopStartKey() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleDeleteKey() (tea.Model, tea.Cmd) {
-	if m.view != viewResources || len(m.filtered) == 0 {
+	if m.view != viewResources || m.cursor >= len(m.filtered) {
 		return m, nil
 	}
 	r := m.filtered[m.cursor]
@@ -1353,7 +1626,7 @@ func (m Model) handleDeleteKey() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleShellKey() (tea.Model, tea.Cmd) {
-	if m.view != viewResources || m.provider().Kind() != "lightsail/instances" || len(m.filtered) == 0 {
+	if m.view != viewResources || m.provider().Kind() != "lightsail/instances" || m.cursor >= len(m.filtered) {
 		return m, nil
 	}
 	r := m.filtered[m.cursor]
@@ -1440,10 +1713,20 @@ func (m Model) View() tea.View {
 		} else if kind == "lightsail/applications" {
 			if m.appDetail != nil && m.detail == nil {
 				targets := applications.AppDetailTargets(m.appDetail)
-				if len(targets) > 0 && !targets[m.appDetailCursor].IsAddTarget {
-					help = " esc:back  j/k:select  enter:detail  x:ssh  d:disassociate  J/K:reorder  p:promote "
-				} else {
-					help = " esc:back  j/k:select  enter:add/detail  x:ssh  J/K:reorder  p:promote "
+				cur := m.appDetailCursor
+				if cur >= len(targets) {
+					cur = max(0, len(targets)-1)
+				}
+				if len(targets) > 0 {
+					t := targets[cur]
+					switch {
+					case t.IsEnvHeader:
+						help = " esc:back  j/k:select  enter:detail  d:delete env  </>:reorder  p:promote  l:logs "
+					case t.IsAddTarget || t.IsAddEnv:
+						help = " esc:back  j/k:select  enter:add  </>:reorder  p:promote  l:logs "
+					default:
+						help = " esc:back  j/k:select  enter:detail  x:ssh  d:disassociate  p:promote  l:logs "
+					}
 				}
 			} else if m.appDetailFrom {
 				help = " esc:app detail  s:stop/start  d:delete  x:shell  [/]:range  ↑↓:scroll "
@@ -1462,6 +1745,15 @@ func (m Model) View() tea.View {
 			screen = utils.Overlay(detailScreen, modal, m.width, m.height)
 		} else if m.disassocProgress != nil {
 			screen = utils.Overlay(detailScreen, m.disassocProgress.View(m.spinner.View(), m.width), m.width, m.height)
+		} else if m.addEnvProgress != nil {
+			screen = utils.Overlay(detailScreen, m.addEnvProgress.View(m.spinner.View(), m.width), m.width, m.height)
+		} else if m.deleteEnvProgress != nil {
+			screen = utils.Overlay(detailScreen, m.deleteEnvProgress.View(m.spinner.View(), m.width), m.width, m.height)
+		} else if m.promoteProgress != nil {
+			screen = utils.Overlay(detailScreen, m.promoteProgress.View(m.spinner.View(), m.width), m.width, m.height)
+		} else if m.reorderingEnvs {
+			modal := utils.TitleStyle.Render(fmt.Sprintf(" %s Updating environment order... ", m.spinner.View()))
+			screen = utils.Overlay(detailScreen, modal, m.width, m.height)
 		} else {
 			screen = detailScreen
 		}
@@ -1473,12 +1765,17 @@ func (m Model) View() tea.View {
 		case viewProviders:
 			screen = utils.Overlay(base, instances.RenderProviderModal(m.providers, m.provCursor), m.width, m.height)
 		case viewConfirm:
-			if m.disassocConfirm != nil {
+			if m.deleteEnvConfirm != "" {
+				base := utils.RenderWithStatusBar(m.detailVP.View(), "", m.width, m.height)
+				screen = utils.Overlay(base, applications.RenderDeleteEnvConfirmModal(m.deleteEnvConfirm), m.width, m.height)
+			} else if m.disassocConfirm != nil {
 				base := utils.RenderWithStatusBar(m.detailVP.View(), "", m.width, m.height)
 				screen = utils.Overlay(base, applications.RenderDisassociateConfirmModal(m.disassocConfirm.Target.Name, m.disassocConfirm.EnvName), m.width, m.height)
 			} else if m.promoteFrom != "" {
 				base := utils.RenderWithStatusBar(m.detailVP.View(), "", m.width, m.height)
 				screen = utils.Overlay(base, applications.RenderPromoteModal(m.promoteFrom, m.promoteTargets, m.promoteCursor), m.width, m.height)
+			} else if len(m.logsEnvSelect) > 0 {
+				screen = utils.Overlay(renderBase(), applications.RenderLogsEnvModal(m.logsAppName, m.logsEnvSelect, m.logsEnvCursor), m.width, m.height)
 			} else if m.appConfirmName != "" {
 				screen = utils.Overlay(renderBase(), applications.RenderAppConfirmModal(m.appConfirmName), m.width, m.height)
 			} else {

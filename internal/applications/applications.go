@@ -111,6 +111,11 @@ func BucketName(accountID, appName, envName string) string {
 	return fmt.Sprintf("%s%s--%s--%s", BucketPrefix, accountID, appName, envName)
 }
 
+// AppBucketName returns the config bucket name for an app: nimbus--<account>--<app>.
+func AppBucketName(accountID, appName string) string {
+	return fmt.Sprintf("%s%s--%s", BucketPrefix, accountID, appName)
+}
+
 // ParseAppName extracts just the app name from a bucket name.
 // ParseAppName extracts just the app name from a bucket name.
 func ParseAppName(bucketName string) string {
@@ -325,10 +330,22 @@ func (c *Client) fetchEnvStatuses(ctx context.Context, s3svc *s3.Client, env *En
 // Create creates a new application bucket for the given env.
 func (c *Client) Create(ctx context.Context, accountID, appName, envName, region string) error {
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
-	bucketName := BucketName(accountID, appName, envName)
 	bundleID := "small_1_0"
+	envBkt := BucketName(accountID, appName, envName)
 	_, err := svc.CreateBucket(ctx, &lightsail.CreateBucketInput{
-		BucketName: &bucketName,
+		BucketName: &envBkt,
+		BundleId:   &bundleID,
+	})
+	return err
+}
+
+// CreateAppBucket creates the app-level config bucket. Call once when creating a new application.
+func (c *Client) CreateAppBucket(ctx context.Context, accountID, appName, region string) error {
+	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
+	bundleID := "small_1_0"
+	appBkt := AppBucketName(accountID, appName)
+	_, err := svc.CreateBucket(ctx, &lightsail.CreateBucketInput{
+		BucketName: &appBkt,
 		BundleId:   &bundleID,
 	})
 	return err
@@ -388,8 +405,14 @@ func (c *Client) DeleteTags(ctx context.Context, appName, region string) error {
 	return nil
 }
 
-// DeleteBuckets deletes all env buckets for the app.
+// DeleteBuckets deletes all buckets for the app (env buckets + app config bucket).
 func (c *Client) DeleteBuckets(ctx context.Context, appName, region string) error {
+	accountID, err := c.AccountID(ctx)
+	if err != nil {
+		return err
+	}
+	appBucket := AppBucketName(accountID, appName)
+
 	svc := lightsail.NewFromConfig(c.aws.WithRegion(region).Config())
 	allBuckets, err := svc.GetBuckets(ctx, &lightsail.GetBucketsInput{})
 	if err != nil {
@@ -400,14 +423,22 @@ func (c *Client) DeleteBuckets(ctx context.Context, appName, region string) erro
 		if b.Name == nil {
 			continue
 		}
+		// Delete env buckets
 		bApp, _ := ParseAppEnv(*b.Name)
-		if bApp != appName {
+		if bApp == appName {
+			svc.DeleteBucket(ctx, &lightsail.DeleteBucketInput{
+				BucketName:  b.Name,
+				ForceDelete: &forceDelete,
+			})
 			continue
 		}
-		svc.DeleteBucket(ctx, &lightsail.DeleteBucketInput{
-			BucketName:  b.Name,
-			ForceDelete: &forceDelete,
-		})
+		// Delete app config bucket
+		if *b.Name == appBucket {
+			svc.DeleteBucket(ctx, &lightsail.DeleteBucketInput{
+				BucketName:  b.Name,
+				ForceDelete: &forceDelete,
+			})
+		}
 	}
 	return nil
 }
@@ -531,6 +562,23 @@ func (c *Client) RemoteUp(ctx context.Context, instanceName, appName, envName, r
 		return fmt.Errorf("remote up: %s: %w", strings.TrimSpace(string(output)), err)
 	}
 	return nil
+}
+
+// RemoteLogsCmd returns an *exec.Cmd that SSHes to the target and streams docker compose logs.
+// The caller is responsible for running the command and cleaning up creds.KeyPath.
+func (c *Client) RemoteLogsCmd(ctx context.Context, appName, envName, region string) (*exec.Cmd, *SSHCredentials, error) {
+	target, err := c.FindTarget(ctx, appName, envName, region)
+	if err != nil {
+		return nil, nil, err
+	}
+	creds, err := c.GetSSHCredentials(ctx, target.Name, region)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get SSH credentials: %w", err)
+	}
+	remoteCmd := fmt.Sprintf("cd /opt/nimbus/%s/%s/current && sudo docker compose logs -f --tail 100", appName, envName)
+	sshTarget := fmt.Sprintf("%s@%s", creds.Username, creds.IP)
+	cmd := exec.CommandContext(ctx, "ssh", append(sshOptions(creds.KeyPath), "-t", sshTarget, remoteCmd)...)
+	return cmd, creds, nil
 }
 
 // RemoteDown SSHes to the instance and runs nimbus app local down.

@@ -104,6 +104,7 @@ func appHelp() {
 				entries: []cmdEntry{
 					{"list (ls)", "List applications in a region"},
 					{"deploy", "Deploy to targets (bucket upload or SSH)"},
+					{"logs", "Stream docker compose logs from a target"},
 					{"rollback", "Roll back to the previous deployment"},
 					{"promote", "Promote a deploy from one env to another"},
 					{"env", "Manage environments (add, list, reorder)"},
@@ -264,6 +265,8 @@ func handleApplication(args []string) {
 		handleEnv(args[1:])
 	case "promote":
 		handlePromote(args[1:])
+	case "logs":
+		handleLogs(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: nimbus app %s\n", args[0])
 		os.Exit(1)
@@ -498,9 +501,9 @@ func handleLocalList(args []string) {
 		fmt.Println("No application environments found in /opt/nimbus")
 		return
 	}
-	fmt.Printf("%-20s %-12s %-14s %s\n", "APP", "ENV", "STATUS", "UNIT")
+	fmt.Printf("%-20s %-12s %-14s %-14s %s\n", "APP", "ENV", "WATCHER", "COMPOSE", "UNIT")
 	for _, e := range envs {
-		fmt.Printf("%-20s %-12s %-14s %s\n", e.App, e.Env, e.Status, e.Unit)
+		fmt.Printf("%-20s %-12s %-14s %-14s %s\n", e.App, e.Env, e.Status, e.Compose, e.Unit)
 	}
 }
 
@@ -768,6 +771,44 @@ func handlePromote(args []string) {
 	if err := deploy.Promote(ctx, client, app.Name, srcEnv, destEnv, r); err != nil {
 		fatal(err)
 	}
+}
+
+func handleLogs(args []string) {
+	fs := flag.NewFlagSet("nimbus app logs", flag.ExitOnError)
+	name := fs.String("name", "", "Application name")
+	env := fs.String("env", "", "Environment name")
+	region := fs.String("region", "", "AWS region")
+	flagHelp(fs, "nimbus app logs — stream docker compose logs from a target", "SSH to the target instance and stream docker compose logs.\nIf flags are omitted, prompts for selection. Press Ctrl-C to stop.")
+	fs.Parse(args)
+
+	r := resolveRegion(*region)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client, err := aws.NewClient(ctx, r)
+	if err != nil {
+		fatal(err)
+	}
+
+	app, err := selectApp(ctx, client, *name, r)
+	if err != nil {
+		fatal(err)
+	}
+	envName := selectEnv(app, *env)
+
+	appClient := applications.NewClient(client)
+	cmd, creds, err := appClient.RemoteLogsCmd(ctx, app.Name, envName, r)
+	if err != nil {
+		fatal(err)
+	}
+	defer os.Remove(creds.KeyPath)
+	defer os.Remove(creds.KeyPath + "-cert.pub")
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	fmt.Printf("Streaming logs for %s/%s (Ctrl-C to stop)...\n", app.Name, envName)
+	cmd.Run() // blocks until Ctrl-C or SSH disconnect
 }
 
 func resolveRegion(r string) string {

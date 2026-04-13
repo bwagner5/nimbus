@@ -35,8 +35,23 @@ func Overlay(base, modal string, width, height int) string {
 	for y := 0; y < height; y++ {
 		if y >= startY && y < startY+modalH {
 			mIdx := y - startY
-			pad := strings.Repeat(" ", startX)
-			result[y] = pad + modalLines[mIdx]
+			// Show dimmed base content on both sides of the modal
+			baseLine := baseLines[y]
+			baseW := lipgloss.Width(baseLine)
+			left := ""
+			if startX > 0 {
+				left = dim.Render(truncateToWidth(baseLine, startX))
+				leftW := lipgloss.Width(left)
+				if leftW < startX {
+					left += strings.Repeat(" ", startX-leftW)
+				}
+			}
+			right := ""
+			endX := startX + modalW
+			if endX < baseW {
+				right = dim.Render(sliceFromWidth(baseLine, endX))
+			}
+			result[y] = left + modalLines[mIdx] + right
 		} else {
 			result[y] = dim.Render(baseLines[y])
 		}
@@ -70,6 +85,29 @@ func CenterModal(modal string, width, height int) string {
 		}
 	}
 	return strings.Join(result, "\n")
+}
+
+
+// sliceFromWidth returns the suffix of s starting after skipW visible columns.
+func sliceFromWidth(s string, skipW int) string {
+	visible := 0
+	inEscape := false
+	for i, r := range s {
+		if r == '\x1b' {
+			inEscape = true
+		}
+		if inEscape {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inEscape = false
+			}
+			continue
+		}
+		if visible >= skipW {
+			return s[i:]
+		}
+		visible++
+	}
+	return ""
 }
 
 // FormatRow formats columns to fit within the given width.

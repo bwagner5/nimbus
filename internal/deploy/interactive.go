@@ -529,6 +529,9 @@ func (m *deployModel) doFirewall() tea.Cmd {
 			return firewallMsg{err: err}
 		}
 		err = client.OpenFirewallPorts(ctx, target.Name, region, ports)
+		if err == nil {
+			client.SaveFirewallRules(ctx, appName, envName, region, ports) // best-effort persist
+		}
 		return firewallMsg{ports: ports, err: err}
 	}
 }

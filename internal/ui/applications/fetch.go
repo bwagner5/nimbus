@@ -3,6 +3,7 @@ package applications
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -68,10 +69,14 @@ func FetchAppDetail(ctx context.Context, client *aws.Client, appName, bucketName
 	}
 }
 
-// CreateApp creates a Lightsail bucket for the application.
+// CreateApp creates the app config bucket and the first env bucket.
 func CreateApp(ctx context.Context, client *aws.Client, accountID, appName, envName, region string) tea.Cmd {
 	return func() tea.Msg {
-		err := applications.NewClient(client).Create(ctx, accountID, appName, envName, region)
+		appClient := applications.NewClient(client)
+		if err := appClient.CreateAppBucket(ctx, accountID, appName, region); err != nil {
+			return CreateAppMsg{Err: err, Name: appName}
+		}
+		err := appClient.Create(ctx, accountID, appName, envName, region)
 		if err != nil {
 			return CreateAppMsg{Err: err, Name: appName}
 		}
@@ -247,12 +252,115 @@ type AddEnvMsg struct {
 	EnvName string
 }
 
-// AddEnv creates a new environment for an app.
-func AddEnv(ctx context.Context, client *aws.Client, appName, envName, region string) tea.Cmd {
+// AddEnvBucketMsg signals the env bucket was created.
+type AddEnvBucketMsg struct {
+	Err     error
+	AppName string
+	EnvName string
+}
+
+// AddEnvSteps returns the step labels for adding an environment.
+func AddEnvSteps(envName string) []string {
+	return []string{
+		fmt.Sprintf("Create bucket for %s", envName),
+		"Update environment order",
+	}
+}
+
+// AddEnvCreateBucket creates the env bucket (step 1).
+func AddEnvCreateBucket(ctx context.Context, client *aws.Client, appName, envName, region string) tea.Cmd {
 	return func() tea.Msg {
-		err := applications.NewClient(client).AddEnvironment(ctx, appName, envName, region)
+		appClient := applications.NewClient(client)
+		accountID, err := appClient.AccountID(ctx)
+		if err != nil {
+			return AddEnvBucketMsg{Err: err, AppName: appName, EnvName: envName}
+		}
+		err = appClient.Create(ctx, accountID, appName, envName, region)
+		return AddEnvBucketMsg{Err: err, AppName: appName, EnvName: envName}
+	}
+}
+
+// AddEnvUpdateOrder updates the env order config (step 2).
+func AddEnvUpdateOrder(ctx context.Context, client *aws.Client, appName, envName, region string) tea.Cmd {
+	return func() tea.Msg {
+		appClient := applications.NewClient(client)
+		order, _ := appClient.GetEnvOrder(ctx, appName, region)
+		found := false
+		for _, e := range order {
+			if e == envName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			order = append(order, envName)
+		}
+		err := appClient.SetEnvOrder(ctx, appName, region, order)
 		return AddEnvMsg{Err: err, AppName: appName, EnvName: envName}
 	}
+}
+
+// DeleteEnvSteps returns the step labels for deleting an environment.
+func DeleteEnvSteps(envName string) []string {
+	return applications.DeleteEnvSteps(envName)
+}
+
+// DeleteEnvDisassocMsg signals targets have been disassociated (step 1).
+type DeleteEnvDisassocMsg struct {
+	EnvName string
+}
+
+// DeleteEnvBucketMsg signals the env bucket has been deleted (step 2).
+type DeleteEnvBucketMsg struct {
+	Err     error
+	EnvName string
+}
+
+// DeleteEnvDoneMsg signals the env deletion is complete (step 3).
+type DeleteEnvDoneMsg struct {
+	Err     error
+	EnvName string
+}
+
+// DeleteEnvDisassocTargets disassociates all targets for an env (step 1).
+func DeleteEnvDisassocTargets(ctx context.Context, client *aws.Client, appName, envName, region string) tea.Cmd {
+	return func() tea.Msg {
+		applications.NewClient(client).DisassociateEnvTargets(ctx, appName, envName, region)
+		return DeleteEnvDisassocMsg{EnvName: envName}
+	}
+}
+
+// DeleteEnvBucket deletes the env bucket (step 2).
+func DeleteEnvBucket(ctx context.Context, client *aws.Client, appName, envName, region string) tea.Cmd {
+	return func() tea.Msg {
+		err := applications.NewClient(client).DeleteEnvBucket(ctx, appName, envName, region)
+		return DeleteEnvBucketMsg{Err: err, EnvName: envName}
+	}
+}
+
+// DeleteEnvUpdateOrder updates the env order after deletion (step 3).
+func DeleteEnvUpdateOrder(ctx context.Context, client *aws.Client, appName, envName, region string) tea.Cmd {
+	return func() tea.Msg {
+		appClient := applications.NewClient(client)
+		order, _ := appClient.GetEnvOrder(ctx, appName, region)
+		var newOrder []string
+		for _, e := range order {
+			if e != envName {
+				newOrder = append(newOrder, e)
+			}
+		}
+		var err error
+		if len(newOrder) > 0 {
+			err = appClient.SetEnvOrder(ctx, appName, region, newOrder)
+		}
+		return DeleteEnvDoneMsg{Err: err, EnvName: envName}
+	}
+}
+
+// RenderDeleteEnvConfirmModal renders a delete environment confirmation.
+func RenderDeleteEnvConfirmModal(envName string) string {
+	return utils.ErrorStyle.Render(fmt.Sprintf(" Delete environment '%s'? This will remove all targets and data. ", envName)) + "\n\n" +
+		utils.HelpStyle.Render(" y:confirm  n/esc:cancel ")
 }
 
 // ReorderEnvMsg signals environment reorder completed.
@@ -283,18 +391,58 @@ func FetchEnvOrder(ctx context.Context, client *aws.Client, appName, region stri
 	}
 }
 
-// PromoteMsg signals promotion completed.
+// PromoteMsg signals promotion completed (step 2).
 type PromoteMsg struct {
 	Err     error
 	SrcEnv  string
 	DestEnv string
 }
 
-// PromoteDeploy promotes the latest deploy from one env to another.
-func PromoteDeploy(ctx context.Context, client *aws.Client, appName, srcEnv, destEnv, region string) tea.Cmd {
+// PromoteDownloadMsg signals the download step completed (step 1).
+type PromoteDownloadMsg struct {
+	Err    error
+	SrcEnv string
+	Result *deploy.PromoteResult
+}
+
+// PromoteSteps returns the step labels for promoting between environments.
+func PromoteSteps(srcEnv, destEnv string) []string {
+	return applications.PromoteSteps(srcEnv, destEnv)
+}
+
+// PromoteDownload downloads the latest deploy from srcEnv (step 1).
+func PromoteDownload(ctx context.Context, client *aws.Client, appName, srcEnv, region string) tea.Cmd {
 	return func() tea.Msg {
-		// Use the deploy package's Promote which handles access keys and transfer
-		err := deploy.Promote(ctx, client, appName, srcEnv, destEnv, region)
-		return PromoteMsg{Err: err, SrcEnv: srcEnv, DestEnv: destEnv}
+		r, err := deploy.PromoteDownload(ctx, client, appName, srcEnv, region)
+		return PromoteDownloadMsg{Err: err, SrcEnv: srcEnv, Result: r}
 	}
+}
+
+// PromoteUpload uploads the deploy to destEnv (step 2).
+func PromoteUpload(ctx context.Context, client *aws.Client, appName, destEnv, region string, r *deploy.PromoteResult) tea.Cmd {
+	return func() tea.Msg {
+		err := deploy.PromoteUpload(ctx, client, appName, destEnv, region, r)
+		return PromoteMsg{Err: err, SrcEnv: "", DestEnv: destEnv}
+	}
+}
+
+// LogsExitMsg signals the logs process exited.
+type LogsExitMsg struct{ Err error }
+
+// LogsExecCmd returns a tea.Cmd that SSHes to the target and streams docker compose logs.
+func LogsExecCmd(ctx context.Context, client *aws.Client, appName, envName, region string) tea.Cmd {
+	return func() tea.Msg {
+		appClient := applications.NewClient(client)
+		cmd, creds, err := appClient.RemoteLogsCmd(ctx, appName, envName, region)
+		if err != nil {
+			return LogsExitMsg{Err: err}
+		}
+		return ExecLogsMsg{Cmd: cmd, KeyPath: creds.KeyPath}
+	}
+}
+
+// ExecLogsMsg carries the prepared command for tea.ExecProcess.
+type ExecLogsMsg struct {
+	Cmd     *exec.Cmd
+	KeyPath string
 }

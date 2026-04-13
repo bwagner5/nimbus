@@ -245,7 +245,11 @@ func (s *CreateScreen) startCreate() tea.Cmd {
 	ctx := s.ctx
 
 	return func() tea.Msg {
-		err := applications.NewClient(client).Create(ctx, accountID, appName, envName, region)
+		appClient := applications.NewClient(client)
+		if err := appClient.CreateAppBucket(ctx, accountID, appName, region); err != nil {
+			return createBucketDoneMsg{Err: err}
+		}
+		err := appClient.Create(ctx, accountID, appName, envName, region)
 		return createBucketDoneMsg{Err: err}
 	}
 }

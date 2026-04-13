@@ -9,13 +9,14 @@ import (
 
 // LocalEnv represents an app/env discovered on the local instance.
 type LocalEnv struct {
-	App    string
-	Env    string
-	Status string // running, stopped, unhealthy, not installed
-	Unit   string // systemd unit name
+	App     string
+	Env     string
+	Status  string // running, stopped, unhealthy, not installed (watcher)
+	Unit    string // systemd unit name
+	Compose string // compose stack: up (N), down, no compose file
 }
 
-// LocalList scans /opt/nimbus for app/env directories and checks systemd status.
+// LocalList scans /opt/nimbus for app/env directories and checks systemd + compose status.
 func LocalList() ([]LocalEnv, error) {
 	apps, err := os.ReadDir("/opt/nimbus")
 	if err != nil {
@@ -40,15 +41,47 @@ func LocalList() ([]LocalEnv, error) {
 			}
 			unit := fmt.Sprintf("nimbus-watch-%s-%s", app.Name(), env.Name())
 			status := serviceStatus(unit)
+			compose := composeStatus(app.Name(), env.Name())
 			result = append(result, LocalEnv{
-				App:    app.Name(),
-				Env:    env.Name(),
-				Status: status,
-				Unit:   unit + ".service",
+				App:     app.Name(),
+				Env:     env.Name(),
+				Status:  status,
+				Unit:    unit + ".service",
+				Compose: compose,
 			})
 		}
 	}
 	return result, nil
+}
+
+func composeStatus(appName, envName string) string {
+	currentDir := fmt.Sprintf("/opt/nimbus/%s/%s/current", appName, envName)
+	var composeFile string
+	for _, name := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
+		p := currentDir + "/" + name
+		if _, err := os.Stat(p); err == nil {
+			composeFile = p
+			break
+		}
+	}
+	if composeFile == "" {
+		return "no compose file"
+	}
+	out, err := exec.Command("docker", "compose", "-f", composeFile, "ps", "--format", "{{.State}}").Output()
+	if err != nil {
+		return "down"
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	running := 0
+	for _, l := range lines {
+		if strings.TrimSpace(l) == "running" {
+			running++
+		}
+	}
+	if running == 0 {
+		return "down"
+	}
+	return fmt.Sprintf("up (%d)", running)
 }
 
 func serviceStatus(unit string) string {

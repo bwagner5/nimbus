@@ -28,7 +28,7 @@ func DeleteSteps(appName string) []string {
 		"Stop deployments on instances",
 		"Remove instance tags",
 		"Clean up firewall rules",
-		"Delete environment buckets",
+		"Delete buckets",
 	}
 }
 
@@ -56,5 +56,14 @@ func PromoteSteps(srcEnv, destEnv string) []string {
 	return []string{
 		fmt.Sprintf("Download latest deploy from %s", srcEnv),
 		fmt.Sprintf("Upload to %s", destEnv),
+	}
+}
+
+// DeleteEnvSteps returns the step labels for deleting an environment.
+func DeleteEnvSteps(envName string) []string {
+	return []string{
+		fmt.Sprintf("Disassociate targets from %s", envName),
+		fmt.Sprintf("Delete bucket for %s", envName),
+		"Update environment order",
 	}
 }
